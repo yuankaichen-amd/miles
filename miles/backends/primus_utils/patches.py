@@ -1,0 +1,393 @@
+"""Run Primus' Megatron patches inside Miles' Megatron train actor.
+
+Primus ships its ROCm and Primus-Turbo work as a registry of monkey patches keyed by
+lifecycle phase. Those patches apply cleanly to the Megatron that Miles installs, so
+Miles can pick them up without adopting Primus' training loop.
+
+Two things shape this module:
+
+* Patches must be applied in the *actor* process. Patching in the driver would not
+  reach a Ray actor, and they must land before the model is built because several of
+  them replace the layer spec provider Megatron reads at construction time.
+* Only Primus' kernel and numerics patches are wanted. Primus also patches
+  checkpointing, dataloading, evaluation, tensorboard, and wandb, all of which Miles
+  owns in an RL run; `megatron.args.tensorboard_path`, for instance, would rewrite
+  `args.tensorboard_dir` out from under Miles. Hence the curated default below, which
+  fails safe: a patch Primus adds later stays inert until it is vetted here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+from typing import Any
+
+from miles.backends.primus_utils.config_bridge import ensure_primus_importable
+from miles.backends.primus_utils.megatron_compat import install_megatron_compat_shims
+
+logger = logging.getLogger(__name__)
+
+# Phases in the order Primus' own runtime drives them.
+_PHASES = ("setup", "build_args", "before_train", "after_train")
+
+# Primus' kernel/numerics patches: the ones that change how math runs on ROCm without
+# touching how a run is orchestrated. Verified against the 65 patches Primus registers.
+_KERNEL_PATCH_IDS = frozenset(
+    {
+        # ROCm runtime tuning
+        "megatron.env.cuda_device_max_connections",
+        "megatron.runtime.skip_compile_dependencies",
+        # low-precision plumbing
+        "megatron.core.fp4_utils",
+        "megatron.fp8.context",
+        "transformer_engine.pytorch.fp8",
+        "megatron.te.delayed_scaling_reduce_amax",
+        "megatron.te.delayed_scaling_save_original_input",
+        "megatron.te.general_gemm_workspace_helper",
+        "megatron.te.layernorm_linear_fp8_cache",
+        "megatron.te.linear_fp8_cache",
+        # tensor-parallel comm/compute overlap
+        "megatron.te.tp_overlap_te1",
+        "megatron.te.tp_overlap_te2",
+        # Primus-Turbo kernels
+        "megatron.turbo.te_spec_provider",
+        "megatron.turbo.moe_dispatcher",
+        "megatron.turbo.rms_norm",
+        "megatron.turbo.attn_hd128_te_fallback",
+        # MoE and attention kernels
+        "megatron.moe.permute_fusion",
+        "megatron.moe.primus_topk_router",
+        "megatron.transformer.patch_mla_attention",
+        "megatron.transformer.custom_recompute_layer_ids",
+        "megatron.gpt.decoder_layer_specs",
+        "megatron.mamba.rocm_chunk_state_bwd_db",
+        "megatron.core.enums",
+    }
+)
+
+# Patches Miles wants but cannot apply, because they reach for Megatron APIs that live in
+# Primus' fork and not in Miles'. Excluded from every selection so a run fails on genuine
+# surprises only; revisit each time either fork moves. Prefer a shim in `megatron_compat`
+# when the gap is only a naming difference.
+_INCOMPATIBLE_PATCH_IDS: dict[str, str] = {}
+
+
+# Primus-Turbo features measured to be unsafe against Miles' Megatron on this stack.
+# Keyed by the Primus config flag that turns the feature on.
+_UNSAFE_TURBO_FEATURES = {
+    "use_turbo_attention": (
+        "PrimusTurboAttention produces wrong gradients as Primus wires it into Megatron. "
+        "Measured on MI300X against TEDotProductAttention with identical weights and inputs "
+        "in bf16: the forward matched to cosine similarity 1.0000, while gradients upstream "
+        "of attention came back at ~0.02-0.36 of the reference norm (cosine 0.08), so "
+        "training would silently converge to the wrong model. The gradient arriving at the "
+        "attention output is exact, so the loss is on the way back out. The kernel itself is "
+        "not at fault: primus_turbo's flash_attn_func matches an fp32 reference to ~4e-3 on "
+        "forward and on dq/dk/dv, for head_dim 64 and 128, causal and not, with both "
+        "contiguous and sbhd-strided inputs. The fault is in Primus' Megatron attention "
+        "wrapper and the root cause is still open. Reproduces at head_dim 64 and 128, so "
+        "Primus' PRIMUS_TURBO_ATTN_HD128_FALLBACK_TE workaround does not cover it"
+    ),
+}
+
+# Escape hatch for anyone deliberately investigating the above.
+_ALLOW_UNSAFE_ENV = "MILES_ALLOW_UNSAFE_PRIMUS_TURBO"
+
+# Primus-Turbo's linear layers each assert tensor parallel size == 1 in their constructor,
+# so these flags are unusable in a sharded run. Caught here because the assertion would
+# otherwise fire deep inside model construction, long after the config was accepted.
+_TP1_ONLY_TURBO_FEATURES = (
+    "use_turbo_gemm",
+    "use_turbo_parallel_linear",
+    "use_turbo_grouped_gemm",
+    "use_turbo_grouped_mlp",
+)
+
+
+def primus_patches_enabled(args: argparse.Namespace) -> bool:
+    """Patches ride along with --primus-config; without it Miles behaves exactly as before."""
+    return bool(getattr(args, "primus_config", None)) and getattr(args, "primus_patches", "none") != "none"
+
+
+class _PrimusLoggerAdapter:
+    """Give Primus' rank-0 log helpers a sink without its file handlers or print hijack.
+
+    Primus' `log_rank_0` dereferences a module-global loguru logger that only
+    `setup_logger` assigns, and the runtime initializer that would assign it also
+    replaces `builtins.print`. Neither is welcome inside a Miles actor.
+    """
+
+    def __init__(self, target: logging.Logger):
+        self._target = target
+
+    def info(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._target.info(message)
+
+    def debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._target.debug(message)
+
+    def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._target.warning(message)
+
+    def error(self, message: str, *args: Any, **kwargs: Any) -> None:
+        self._target.error(message)
+
+
+class _PrimusParamsView:
+    """The single namespace Primus patches expect, without merging into Miles' args.
+
+    Primus' runtime hands patches one namespace holding both the Megatron arguments and
+    the Primus-only parameters. Miles keeps those separate, so this reads through to
+    `args` first and falls back to the Primus parameters. Writes follow the same route,
+    which keeps `args` authoritative for anything Megatron consumes.
+    """
+
+    def __init__(self, args: argparse.Namespace, primus_params: dict[str, Any]):
+        object.__setattr__(self, "_args", args)
+        object.__setattr__(self, "_primus_params", primus_params)
+
+    def __getattr__(self, name: str) -> Any:
+        args = object.__getattribute__(self, "_args")
+        if hasattr(args, name):
+            return getattr(args, name)
+        primus_params = object.__getattribute__(self, "_primus_params")
+        if name in primus_params:
+            return primus_params[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        args = object.__getattribute__(self, "_args")
+        primus_params = object.__getattribute__(self, "_primus_params")
+        if name in primus_params and not hasattr(args, name):
+            primus_params[name] = value
+        else:
+            setattr(args, name, value)
+
+
+def _resolve_enabled_ids(selection: str, registered_ids: set[str]) -> list[str]:
+    """Turn --primus-patches into the concrete list of patch ids to apply."""
+    selection = (selection or "kernels").strip()
+    if selection == "none":
+        return []
+    if selection == "all":
+        return sorted(registered_ids - set(_INCOMPATIBLE_PATCH_IDS))
+    if selection == "kernels":
+        return sorted((_KERNEL_PATCH_IDS & registered_ids) - set(_INCOMPATIBLE_PATCH_IDS))
+
+    requested = [item.strip() for item in selection.split(",") if item.strip()]
+    unknown = sorted(set(requested) - registered_ids)
+    if unknown:
+        raise ValueError(f"--primus-patches names {len(unknown)} unregistered patch id(s): {', '.join(unknown)}")
+    # An explicitly named patch is the caller's call, but say so when it is a known break.
+    for patch_id in requested:
+        if patch_id in _INCOMPATIBLE_PATCH_IDS:
+            logger.warning(
+                "Primus patch '%s' is known to be incompatible with Miles' Megatron: %s.",
+                patch_id,
+                _INCOMPATIBLE_PATCH_IDS[patch_id],
+            )
+    return requested
+
+
+class PrimusPatchRunner:
+    """Applies Primus' Megatron patches for one training actor."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        ensure_primus_importable(getattr(args, "primus_path", None))
+        self._install_logging()
+        # Must precede any patch: several reach for Megatron types Miles' fork spells
+        # differently, and the Turbo spec provider is among them.
+        install_megatron_compat_shims()
+
+        # Importing the package is what fills Primus' patch registry.
+        import primus.backends.megatron.patches  # noqa: F401
+        from primus.core.patches import PatchRegistry
+
+        self._registry = PatchRegistry
+        registered_ids = {patch.id for patch in PatchRegistry._all_patches}
+        self._enabled_ids = _resolve_enabled_ids(getattr(args, "primus_patches", "kernels"), registered_ids)
+        self._params_view = _PrimusParamsView(args, dict(getattr(args, "primus_params", {}) or {}))
+        self._install_primus_global_args()
+        self._reject_unsafe_turbo_features()
+        self._reject_tensor_parallel_turbo_linears()
+        self._backend_version = self._detect_backend_version()
+
+        logger.info(
+            "Primus patches: %d of %d registered patches selected (Megatron %s). "
+            "Miles keeps ownership of the rest.",
+            len(self._enabled_ids),
+            len(registered_ids),
+            self._backend_version or "version unknown",
+        )
+        for patch_id, reason in _INCOMPATIBLE_PATCH_IDS.items():
+            if patch_id in registered_ids and patch_id not in self._enabled_ids:
+                logger.warning("Primus patch '%s' held back: %s.", patch_id, reason)
+
+    @classmethod
+    def create_if_enabled(cls, args: argparse.Namespace) -> PrimusPatchRunner | None:
+        return cls(args) if primus_patches_enabled(args) else None
+
+    def _install_logging(self) -> None:
+        from primus.core.utils import logger as primus_logger
+        from primus.modules.module_utils import set_logging_rank
+
+        if primus_logger._logger is None:
+            primus_logger._logger = _PrimusLoggerAdapter(logger)
+
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            set_logging_rank(dist.get_rank(), dist.get_world_size())
+
+    def _install_primus_global_args(self) -> None:
+        """Point Primus' args global at the params view.
+
+        Primus' backend code reads configuration through `get_primus_args()` rather than
+        through the patch context; `PrimusTurboSpecProvider`, for one, resolves every
+        `use_turbo_*` flag that way at construction time. Only the args global is set
+        here: Primus' own initializer would also open an MLflow run, which is Miles'
+        business, not Primus'.
+        """
+        from primus.backends.megatron.training import global_vars
+
+        global_vars.set_args(self._params_view)
+
+    def _reject_unsafe_turbo_features(self) -> None:
+        """Refuse Primus-Turbo features known to train silently wrong here.
+
+        Failing at startup is the point: these features produce a correct forward pass, so
+        nothing downstream would look wrong until the model did.
+        """
+        enabled = [
+            (flag, reason)
+            for flag, reason in _UNSAFE_TURBO_FEATURES.items()
+            if getattr(self._params_view, flag, False)
+        ]
+        if not enabled:
+            return
+
+        if os.environ.get(_ALLOW_UNSAFE_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+            for flag, reason in enabled:
+                logger.warning(
+                    "Primus config enables %s, which is known to be unsafe here, and "
+                    "%s is set. Proceeding anyway: %s.",
+                    flag,
+                    _ALLOW_UNSAFE_ENV,
+                    reason,
+                )
+            return
+
+        details = "\n".join(f"  {flag}: {reason}." for flag, reason in enabled)
+        raise RuntimeError(
+            f"The Primus config enables {len(enabled)} Primus-Turbo feature(s) that Miles "
+            f"does not consider safe:\n{details}\n"
+            f"Turn the flag off in the Primus YAML (or with --primus-override "
+            f"{enabled[0][0]}=false), or set {_ALLOW_UNSAFE_ENV}=1 to override deliberately."
+        )
+
+    def _reject_tensor_parallel_turbo_linears(self) -> None:
+        """Reject Turbo linear kernels when the run is tensor-parallel.
+
+        Every Primus-Turbo linear class asserts `tp_size == 1`, so these flags cannot work
+        in a sharded run. The assertion would otherwise surface as a bare AssertionError
+        while a transformer layer is being built.
+        """
+        tp_size = int(getattr(self.args, "tensor_model_parallel_size", 1) or 1)
+        if tp_size <= 1:
+            return
+
+        enabled = [flag for flag in _TP1_ONLY_TURBO_FEATURES if getattr(self._params_view, flag, False)]
+        if not enabled:
+            return
+
+        raise RuntimeError(
+            f"The Primus config enables {', '.join(enabled)} with "
+            f"--tensor-model-parallel-size {tp_size}, but Primus-Turbo's linear layers assert "
+            f"tensor parallel size == 1. Either run with tensor parallel size 1 or turn these "
+            f"flags off, e.g. --primus-override {enabled[0]}=false."
+        )
+
+    def bind_megatron_global_args(self) -> None:
+        """Point Megatron's args global at the params view, once Megatron has set one.
+
+        Primus-Turbo's kernels read their configuration from `megatron.training.get_args()`
+        rather than from Primus' own global, and they reach for names like
+        `use_turbo_grouped_gemm` and `enable_turbo_attention_float8` that Miles' Megatron
+        never defines. The view keeps every existing Megatron consumer seeing exactly the
+        values Miles validated, while giving Turbo the Primus parameters it expects.
+
+        Call this after Megatron is initialised and before the model is built.
+        """
+        from megatron.training import global_vars
+
+        installed = getattr(global_vars, "_GLOBAL_ARGS", None)
+        if installed is None:
+            logger.warning(
+                "Megatron has no global args yet, so Primus-Turbo kernels would not see "
+                "their parameters. Skipping; call this after Megatron is initialised."
+            )
+            return
+
+        if not isinstance(installed, _PrimusParamsView):
+            # Read through whatever Megatron actually installed, which is the namespace
+            # its own validation ran over.
+            object.__setattr__(self._params_view, "_args", installed)
+        global_vars.set_args(self._params_view)
+
+    def _detect_backend_version(self) -> str | None:
+        """Report Miles' Megatron version so version-gated patches evaluate correctly."""
+        from primus.backends.megatron.megatron_adapter import MegatronAdapter
+
+        try:
+            return MegatronAdapter().detect_backend_version()
+        except Exception as e:
+            logger.warning("Could not detect Megatron version for Primus patch gating: %s", e)
+            return None
+
+    def _context_kwargs(self, phase: str) -> dict[str, Any]:
+        module_config = argparse.Namespace(
+            name=getattr(self.args, "primus_module", "pre_trainer"),
+            framework="megatron",
+            params=self._params_view,
+        )
+        return dict(
+            backend="megatron",
+            phase=phase,
+            backend_version=self._backend_version,
+            module_name=getattr(self.args, "primus_module", "pre_trainer"),
+            # `backend_args` and `params` are the same object in Primus' runtime too.
+            extra={"backend_args": self._params_view, "module_config": module_config},
+        )
+
+    def run(self, phase: str) -> int:
+        """Apply the selected patches for one phase, returning how many were applied."""
+        assert phase in _PHASES, f"unknown Primus patch phase '{phase}', expected one of {_PHASES}"
+        if not self._enabled_ids:
+            return 0
+
+        from primus.core.patches import run_patches
+
+        # A kernel patch that fails leaves the model training with different numerics than
+        # the config asked for, so surface it instead of degrading quietly.
+        applied = run_patches(
+            **self._context_kwargs(phase),
+            enabled_ids=self._enabled_ids,
+            stop_on_error=True,
+        )
+        logger.info("Primus patches: applied %d patch(es) in phase '%s'.", applied, phase)
+        return applied
+
+    def inventory(self) -> dict[str, list[str]]:
+        """The patch ids that would fire per phase, for inspection without applying them."""
+        from primus.core.patches import PatchContext
+
+        result: dict[str, list[str]] = {}
+        for phase in _PHASES:
+            ctx = PatchContext(**self._context_kwargs(phase))
+            candidates = [
+                p for p in self._registry.iter_patches(backend="megatron", phase=phase) if p.id in self._enabled_ids
+            ]
+            result[phase] = sorted(p.id for p in candidates if p.applies_to(ctx))
+        return result

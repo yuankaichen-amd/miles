@@ -151,7 +151,7 @@ Sections mirror the launch-script argument groups.
 
 | Flag | Type | Default | Notes |
 |---|---|---|---|
-| `--train-backend` | enum | `megatron` | `megatron` or `fsdp`. |
+| `--train-backend` | enum | `megatron` | `megatron`, `fsdp`, or `primus`. `primus` trains with Megatron, configured by the `--primus-config` experiment YAML and patched with Primus' kernels. |
 | `--hf-checkpoint` | path | – | HF model dir. Provides tokenizer, config, and the weights FSDP loads. |
 | `--ref-load` | path | – | Reference model in `torch_dist` format (Megatron). |
 | `--load` | path | – | Actor checkpoint to resume from. |

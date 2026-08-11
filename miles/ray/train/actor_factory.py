@@ -8,6 +8,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.utils.environ import default_fp8_block_scaling_fp32_scales
 from miles.utils.ft_utils.heartbeat_utils import HeartbeatStatus
+from miles.utils.train_backend import uses_megatron
 
 
 def allocate_gpus_for_actor(
@@ -41,7 +42,7 @@ def allocate_gpus_for_actor(
     if source_patcher_config := args.dumper_source_patcher_config_train:
         env_vars["DUMPER_SOURCE_PATCHER_CONFIG"] = source_patcher_config
 
-    if args.offload_train and args.train_backend == "megatron":
+    if args.offload_train and uses_megatron(args.train_backend):
         from torch_memory_saver.utils import get_binary_path_from_package
 
         dynlib_path = str(get_binary_path_from_package("torch_memory_saver_hook_mode_preload"))
@@ -60,7 +61,12 @@ def allocate_gpus_for_actor(
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
     backend = args.train_backend
-    if backend == "megatron":
+    if backend == "primus":
+        from miles.backends.primus_utils.actor import PrimusTrainRayActor
+
+        actor_impl = PrimusTrainRayActor
+
+    elif backend == "megatron":
         from miles.backends.megatron_utils.actor import MegatronTrainRayActor
 
         actor_impl = MegatronTrainRayActor
@@ -89,7 +95,7 @@ def allocate_gpus_for_actor(
                 placement_group_bundle_index=reordered_bundle_indices[rank],
             ),
         )
-        if args.offload_train_target == "disk" and args.offload_train and args.train_backend == "megatron":
+        if args.offload_train_target == "disk" and args.offload_train and uses_megatron(args.train_backend):
             rank_dir = os.path.join(args.offload_train_disk_dir, f"cell{cell_index}_rank{rank}")
             options["runtime_env"] = {"env_vars": {**env_vars, "TMS_DISK_BACKUP_DIR": rank_dir}}
         actor = TrainRayActor.options(**options).remote(

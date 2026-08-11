@@ -1,0 +1,53 @@
+work_group: miles
+user_name: miles
+exp_name: qwen3_0.6B_bf16_rl
+workspace: /workspace/miles/output/primus
+
+modules:
+  pre_trainer:
+    framework: megatron
+    config: pre_trainer.yaml
+    model: qwen3_0.6B.yaml
+    overrides:
+      # bf16 only: no fp8/fp4 path is exercised here.
+      bf16: true
+      fp16: false
+
+      # Primus-Turbo kernels. Only RMSNorm is on: it is the one verified
+      # bit-identical against Transformer Engine on gfx942 at both TP=1 and TP=2.
+      # Attention is left off because Primus' Megatron wrapper returns wrong
+      # gradients (the kernel itself is fine), and the Turbo linear/GEMM layers
+      # are left off because they assert tensor_model_parallel_size == 1.
+      enable_primus_turbo: true
+      use_turbo_rms_norm: true
+      use_turbo_attention: false
+      use_turbo_gemm: false
+      use_turbo_parallel_linear: false
+      use_turbo_grouped_gemm: false
+      use_turbo_grouped_mlp: false
+
+      # Megatron knobs Primus' pretraining presets set for a pretraining loop
+      # rather than an RL loop; Miles owns these.
+      exit_on_missing_checkpoint: false
+      enable_one_logger: false
+      # Miles drives evaluation from its own rollout data, so leave Megatron's
+      # pretraining eval schedule unset.
+      eval_interval: null
+      eval_iters: 0
+      # Checkpointing is driven by Miles' --save/--save-interval, not the preset's.
+      save_interval: null
+
+      # Primus' pretraining presets pin a fixed sequence budget and a warmup
+      # schedule. In an RL run the sequence length follows the rollout length and
+      # the schedule follows Miles' flags, so hand these back.
+      seq_length: 4096
+      max_position_embeddings: 4096
+      rotary_scaling_factor: 1.0
+      micro_batch_size: 1
+      # This ROCm image builds Transformer Engine with the fused (CK) attention
+      # backend and ships NVTE_FLASH_ATTN=0, so asking for flash attention here
+      # trips Megatron's backend check.
+      use_flash_attn: false
+      train_iters: null
+      lr_warmup_iters: 0
+      override_opt_param_scheduler: false

@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 from sglang_router.launch_router import RouterArgs
 
+from miles.backends.primus_utils.config_bridge import PrimusConfigBridge, add_primus_arguments
 from miles.backends.sglang_utils.arguments import add_sglang_arguments
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
@@ -21,6 +22,7 @@ from miles.utils.megatron_args_utils import compute_megatron_world_size_except_d
 from miles.utils.misc import load_function
 from miles.utils.object_store import ObjectStoreBackend
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
+from miles.utils.train_backend import TRAIN_BACKENDS, uses_megatron
 
 logger = logging.getLogger(__name__)
 
@@ -243,9 +245,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--train-backend",
                 type=str,
-                choices=["megatron", "fsdp"],
+                choices=list(TRAIN_BACKENDS),
                 default="megatron",
-                help="The backend for training.",
+                help="The backend for training. 'primus' trains with Megatron, configured "
+                "by the --primus-config experiment YAML and patched with Primus' kernels.",
             )
             parser.add_argument(
                 "--qkv-format",
@@ -2369,6 +2372,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_primus_arguments(parser)
         if enable_experimental_rollout_refactor():
             parser = add_user_provided_function_arguments(parser)
 
@@ -2393,10 +2397,21 @@ def parse_args(add_custom_arguments=None):
     add_miles_arguments = get_miles_extra_args_provider(add_custom_arguments)
 
     backend = parse_args_train_backend()
-    if backend == "megatron":
+    primus_bridge = PrimusConfigBridge.from_argv()
+    assert (
+        primus_bridge is None or backend == "primus"
+    ), f"--primus-config requires --train-backend primus, got '{backend}'"
+    assert not (
+        backend == "primus" and primus_bridge is None
+    ), "--train-backend primus requires --primus-config <experiment yaml>"
+
+    if uses_megatron(backend):
         from miles.backends.megatron_utils.arguments import parse_args as megatron_parse_args
         from miles.backends.megatron_utils.arguments import set_default_megatron_args
         from miles.backends.megatron_utils.arguments import validate_args as megatron_validate_args
+
+        if primus_bridge is not None:
+            add_miles_arguments = primus_bridge.wrap_extra_args_provider(add_miles_arguments)
 
         args = megatron_parse_args(extra_args_provider=add_miles_arguments)
         args.compress_ratios = None
@@ -2413,6 +2428,8 @@ def parse_args(add_custom_arguments=None):
         args.rank = 0
         args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
         args = set_default_megatron_args(args)
+        if primus_bridge is not None:
+            args = primus_bridge.attach(args)
     else:
         from miles.backends.experimental.fsdp_utils.arguments import load_fsdp_args
 
@@ -2429,7 +2446,7 @@ def parse_args(add_custom_arguments=None):
 
     miles_validate_args(args)
 
-    if backend == "megatron":
+    if uses_megatron(backend):
         megatron_validate_args(args)
 
         # always use varlen
