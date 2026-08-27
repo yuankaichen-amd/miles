@@ -101,13 +101,13 @@ ray job submit --address="http://127.0.0.1:8265" \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
   --context-parallel-size 1 \
-  --use-dynamic-batch-size \
-  --max-tokens-per-gpu 16384 \
+  --qkv-format bshd \
+  --micro-batch-size 1 \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0 \
   --accumulate-allreduce-grads-in-fp32 \
   --attention-softmax-in-fp32 \
-  --attention-backend fused \
+  --attention-backend unfused \
   --rollout-num-gpus-per-engine 1 \
   --sglang-mem-fraction-static 0.4 \
   --use-miles-router \

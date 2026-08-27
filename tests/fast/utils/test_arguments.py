@@ -586,3 +586,42 @@ class TestValidateAsyncOffPolicyCorrection:
 
     def test_non_ppo_estimators_are_unaffected(self):
         validate_async_off_policy_correction(_make_async_ppo_args(use_critic=False))
+
+
+class TestQkvFormat:
+    def _parse(self, extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args(["--num-rollout", "1"] + REQUIRED_ARGS + extra)
+
+    def test_bshd_is_accepted_for_primus(self):
+        args = self._parse(["--qkv-format", "bshd", "--train-backend", "primus", "--micro-batch-size", "1"])
+        miles_validate_args(args)
+        assert args.qkv_format == "bshd"
+        assert args.train_backend == "primus"
+        assert args.use_dynamic_batch_size is False
+
+    def test_bshd_is_accepted_for_megatron(self):
+        args = self._parse(["--qkv-format", "bshd", "--train-backend", "megatron", "--micro-batch-size", "1"])
+        miles_validate_args(args)
+        assert args.qkv_format == "bshd"
+
+    def test_bshd_is_rejected_for_fsdp(self):
+        args = self._parse(["--qkv-format", "bshd", "--train-backend", "fsdp", "--micro-batch-size", "1"])
+        with pytest.raises(AssertionError, match="Megatron-family"):
+            miles_validate_args(args)
+
+    def test_bshd_rejects_dynamic_batch_size(self):
+        args = self._parse(
+            [
+                "--qkv-format",
+                "bshd",
+                "--train-backend",
+                "primus",
+                "--use-dynamic-batch-size",
+                "--max-tokens-per-gpu",
+                "1024",
+            ]
+        )
+        with pytest.raises(AssertionError, match="Dynamic batch size is not supported"):
+            miles_validate_args(args)

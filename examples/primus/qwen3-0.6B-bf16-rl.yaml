@@ -1,7 +1,7 @@
 work_group: miles
 user_name: miles
 exp_name: qwen3_0.6B_bf16_rl
-workspace: /workspace/miles/output/primus
+workspace: /root/miles/output/primus
 
 modules:
   pre_trainer:
@@ -12,6 +12,9 @@ modules:
       # bf16 only: no fp8/fp4 path is exercised here.
       bf16: true
       fp16: false
+      # Qwen3-0.6B ties input/output embeddings (HF tie_word_embeddings=true).
+      # Primus' qwen2.5_base preset unties them, which fails Miles' HF check.
+      untie_embeddings_and_output_weights: false
 
       # Primus-Turbo kernels. Only RMSNorm is on: it is the one verified
       # bit-identical against Transformer Engine on gfx942 at both TP=1 and TP=2.
@@ -44,9 +47,9 @@ modules:
       max_position_embeddings: 4096
       rotary_scaling_factor: 1.0
       micro_batch_size: 1
-      # This ROCm image builds Transformer Engine with the fused (CK) attention
-      # backend and ships NVTE_FLASH_ATTN=0, so asking for flash attention here
-      # trips Megatron's backend check.
+      # Miles --attention-backend unfused is the TE fallback when fused CK
+      # attention is unavailable. Packed THD is no longer required: this
+      # recipe uses --qkv-format bshd (padded).
       use_flash_attn: false
       train_iters: null
       lr_warmup_iters: 0

@@ -231,7 +231,12 @@ class PrimusPatchRunner:
 
     def _install_logging(self) -> None:
         from primus.core.utils import logger as primus_logger
-        from primus.modules.module_utils import set_logging_rank
+
+        try:
+            from primus.modules.module_utils import set_logging_rank
+        except ModuleNotFoundError:
+            # Upstream Primus-LM moved this helper out of the removed `primus.modules` package.
+            from primus.core.utils.module_utils import set_logging_rank
 
         if primus_logger._logger is None:
             primus_logger._logger = _PrimusLoggerAdapter(logger)

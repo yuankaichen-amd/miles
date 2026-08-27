@@ -1,0 +1,42 @@
+work_group: miles
+user_name: miles
+exp_name: qwen3_0.6B_bf16_rl_turbo_attn
+workspace: /root/miles/output/primus-turbo-attn
+
+modules:
+  pre_trainer:
+    framework: megatron
+    config: pre_trainer.yaml
+    model: qwen3_0.6B.yaml
+    overrides:
+      bf16: true
+      fp16: false
+      untie_embeddings_and_output_weights: false
+
+      # Exercise Primus-Turbo attention. Miles refuses this unless
+      # MILES_ALLOW_UNSAFE_PRIMUS_TURBO=1: PrimusTurboAttention's forward
+      # matches TE, but the Megatron wrapper has been measured to return
+      # wrong upstream gradients. This recipe is a wiring/kernel smoke, not
+      # a claim that the grads are correct.
+      enable_primus_turbo: true
+      use_turbo_rms_norm: true
+      use_turbo_attention: true
+      use_turbo_gemm: false
+      use_turbo_parallel_linear: false
+      use_turbo_grouped_gemm: false
+      use_turbo_grouped_mlp: false
+
+      exit_on_missing_checkpoint: false
+      enable_one_logger: false
+      eval_interval: null
+      eval_iters: 0
+      save_interval: null
+
+      seq_length: 4096
+      max_position_embeddings: 4096
+      rotary_scaling_factor: 1.0
+      micro_batch_size: 1
+      use_flash_attn: false
+      train_iters: null
+      lr_warmup_iters: 0
+      override_opt_param_scheduler: false

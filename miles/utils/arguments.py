@@ -3110,7 +3110,10 @@ def miles_validate_args(args):
     ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
 
     if args.qkv_format == "bshd":
-        assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
+        assert uses_megatron(args.train_backend), (
+            "bshd format is only supported for Megatron-family backends "
+            f"(got --train-backend {args.train_backend})."
+        )
         assert (
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
