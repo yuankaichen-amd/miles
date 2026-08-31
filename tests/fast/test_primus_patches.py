@@ -90,6 +90,27 @@ def test_compat_shim_aliases_grouped_mlp_submodules():
     assert install_megatron_compat_shims() == []
 
 
+def test_primus_topk_router_is_registered_for_hf_bridge():
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+
+    from miles.backends.primus_utils.patches import register_primus_bridge_module_types
+
+    register_primus_bridge_module_types()
+    assert "PrimusTopKRouter" in AutoMapping._MODULE_TYPE_REGISTRY["replicated"]
+    assert "PrimusTurboRMSNorm" in AutoMapping._MODULE_TYPE_REGISTRY["replicated"]
+    assert "PrimusTurboColumnParallelGroupedLinear" in AutoMapping._MODULE_TYPE_REGISTRY["column"]
+    assert "PrimusTurboRowParallelGroupedLinear" in AutoMapping._MODULE_TYPE_REGISTRY["row"]
+
+
+def test_turbo_grouped_linear_packed_weights_are_not_expert_indexed():
+    from miles.backends.primus_utils.patches import _is_expert_indexed_param
+
+    assert _is_expert_indexed_param("decoder.layers.0.mlp.experts.linear_fc1.weight0")
+    assert _is_expert_indexed_param("decoder.layers.0.mlp.experts.linear_fc2.bias3")
+    assert not _is_expert_indexed_param("decoder.layers.0.mlp.experts.linear_fc1.weights")
+    assert not _is_expert_indexed_param("decoder.layers.0.self_attention.linear_qkv.weight")
+
+
 def test_turbo_spec_provider_is_installed(monkeypatch, tmp_path, restore_megatron_globals):
     """The spec provider is how every Primus-Turbo kernel reaches the model."""
     from megatron.core.models.gpt import gpt_layer_specs

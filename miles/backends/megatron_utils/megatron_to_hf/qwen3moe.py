@@ -23,6 +23,8 @@ def convert_qwen3moe_to_hf(args, name, param):
         layer_idx, rest = match.groups()
 
         # experts
+        if rest in ("mlp.experts.linear_fc1.weights", "mlp.experts.linear_fc2.weights"):
+            return []
         expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
         match = re.match(expert_pattern, rest)
         if match:

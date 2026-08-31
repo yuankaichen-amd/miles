@@ -403,6 +403,11 @@ def collect_named_tensors_for_weight_transfer(
         translate_gpu_to_cpu,
     ):
         if is_expert is None or is_expert == (".experts." in name):
+            # Primus-Turbo grouped GEMM packs expert shards into one Parameter
+            # named `weights`. Per-expert `weight{i}` views are what HF/SGLang
+            # conversion understands; the packed tensor is a duplicate.
+            if name.endswith(".weights") and ".experts." in name:
+                continue
             yield name, tensor
 
 

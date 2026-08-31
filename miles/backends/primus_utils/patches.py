@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 from typing import Any
 
 from miles.backends.primus_utils.config_bridge import ensure_primus_importable
@@ -56,6 +57,9 @@ _KERNEL_PATCH_IDS = frozenset(
         "megatron.turbo.rms_norm",
         "megatron.turbo.attn_hd128_te_fallback",
         # MoE and attention kernels
+        # Turbo grouped GEMM reads tokens_per_expert on device; without this
+        # the all-to-all dispatcher copies it to host.
+        "megatron.moe_alltoall_dtoh_turbo_grouped_gemm",
         "megatron.moe.permute_fusion",
         "megatron.moe.primus_topk_router",
         "megatron.transformer.patch_mla_attention",
@@ -103,6 +107,119 @@ _TP1_ONLY_TURBO_FEATURES = (
     "use_turbo_grouped_gemm",
     "use_turbo_grouped_mlp",
 )
+
+# Megatron-Bridge AutoMapping keys off class __name__, not MRO. Primus replaces
+# several Megatron modules; without these aliases, HF weight load fails on MoE
+# (`PrimusTopKRouter` is not in the built-in replicated set that contains `TopKRouter`).
+_PRIMUS_BRIDGE_MODULE_TYPES: tuple[tuple[str, str], ...] = (
+    ("PrimusTopKRouter", "replicated"),
+    ("PrimusTurboRMSNorm", "replicated"),
+    ("PrimusTurboAttention", "column"),
+    ("PrimusSharedExpertMLP", "column"),
+    ("PrimusTurboColumnParallelLinear", "column"),
+    ("PrimusTurboRowParallelLinear", "row"),
+    ("PrimusTurboLayerNormColumnParallelLinear", "column"),
+    ("PrimusTurboColumnParallelGroupedLinear", "column"),
+    ("PrimusTurboRowParallelGroupedLinear", "row"),
+)
+
+
+_TURBO_GROUPED_LINEAR_NAMES = frozenset(
+    {
+        "PrimusTurboGroupedLinear",
+        "PrimusTurboColumnParallelGroupedLinear",
+        "PrimusTurboRowParallelGroupedLinear",
+    }
+)
+
+# Primus-Turbo packs TE's weight0..N into one Parameter named `weights`. Bridge's
+# EP rewrite treats any `.weight` substring as `weight{expert_id}`, so `weights`
+# becomes int("s"). Also those per-expert views are deferred until first forward,
+# so HF load would otherwise see only the packed tensor.
+_EXPERT_INDEXED_PARAM = re.compile(r"\.(weight|bias)\d+$")
+_HF_BRIDGE_FIXES_INSTALLED = False
+
+
+def _is_expert_indexed_param(param_name: str) -> bool:
+    return bool(_EXPERT_INDEXED_PARAM.search(param_name))
+
+
+def ensure_turbo_grouped_linear_weight_views(model: Any) -> int:
+    """Materialize per-expert weight{i} views before Megatron-Bridge walks parameters."""
+    models = model if isinstance(model, (list, tuple)) else [model]
+    n = 0
+    for chunk in models:
+        for module in chunk.modules():
+            if type(module).__name__ not in _TURBO_GROUPED_LINEAR_NAMES:
+                continue
+            ensure = getattr(module, "_ensure_weight_views", None)
+            if callable(ensure):
+                ensure()
+                n += 1
+    if n:
+        logger.info("Registered per-expert weight views on %d Primus-Turbo grouped linear module(s).", n)
+    return n
+
+
+def install_primus_hf_bridge_fixes() -> None:
+    """Make Megatron-Bridge HF load work with Primus-Turbo grouped GEMM."""
+    global _HF_BRIDGE_FIXES_INSTALLED
+    if _HF_BRIDGE_FIXES_INSTALLED:
+        return
+    try:
+        import megatron.bridge.models.conversion.model_bridge as model_bridge
+        from megatron.bridge import AutoBridge
+    except ImportError:
+        logger.warning("megatron.bridge is unavailable; Turbo grouped-linear HF load fixes were not installed.")
+        return
+
+    original_local_to_global = model_bridge._megatron_local_name_to_global
+
+    def _local_name_to_global(models, config, param_name, vp_stage=None):
+        # Packed `...linear_fc1.weights` still matches the expert-param prefix, but
+        # it is not expert-indexed. Rewrite via a dummy name so the EP branch that
+        # parses `weight{N}` never sees the `weights` suffix.
+        if ".mlp.experts.linear_fc" in param_name and not _is_expert_indexed_param(param_name):
+            dummy = param_name.replace(".weights", ".__turbo_packed__")
+            mapped = original_local_to_global(models, config, dummy, vp_stage)
+            return mapped.replace(".__turbo_packed__", ".weights")
+        return original_local_to_global(models, config, param_name, vp_stage)
+
+    model_bridge._megatron_local_name_to_global = _local_name_to_global
+
+    def _wrap_with_weight_views(method):
+        def wrapped(self, model, *args, **kwargs):
+            ensure_turbo_grouped_linear_weight_views(model)
+            return method(self, model, *args, **kwargs)
+
+        return wrapped
+
+    AutoBridge.load_hf_weights = _wrap_with_weight_views(AutoBridge.load_hf_weights)
+    AutoBridge.export_hf_weights = _wrap_with_weight_views(AutoBridge.export_hf_weights)
+    AutoBridge.save_hf_pretrained = _wrap_with_weight_views(AutoBridge.save_hf_pretrained)
+    AutoBridge.save_hf_weights = _wrap_with_weight_views(AutoBridge.save_hf_weights)
+    _HF_BRIDGE_FIXES_INSTALLED = True
+    logger.info("Installed Megatron-Bridge fixes for Primus-Turbo grouped linear HF load.")
+
+
+def register_primus_bridge_module_types() -> None:
+    """Tell Megatron-Bridge how Primus' replacement modules are sharded."""
+    try:
+        from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    except ImportError:
+        logger.warning(
+            "megatron.bridge is unavailable; Primus module types were not registered. "
+            "--megatron-to-hf-mode bridge will fail if Primus replaced TopKRouter or similar."
+        )
+        return
+
+    for module_name, parallelism_type in _PRIMUS_BRIDGE_MODULE_TYPES:
+        AutoMapping.register_module_type(module_name, parallelism_type)
+    logger.info(
+        "Registered %d Primus module type(s) with Megatron-Bridge AutoMapping.",
+        len(_PRIMUS_BRIDGE_MODULE_TYPES),
+    )
+    install_primus_hf_bridge_fixes()
 
 
 def primus_patches_enabled(args: argparse.Namespace) -> bool:
@@ -200,6 +317,7 @@ class PrimusPatchRunner:
         # Must precede any patch: several reach for Megatron types Miles' fork spells
         # differently, and the Turbo spec provider is among them.
         install_megatron_compat_shims()
+        register_primus_bridge_module_types()
 
         # Importing the package is what fills Primus' patch registry.
         import primus.backends.megatron.patches  # noqa: F401
