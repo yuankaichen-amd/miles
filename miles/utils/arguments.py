@@ -15,6 +15,7 @@ from miles.backends.megatron_utils.megatron_config import (
     resolve_args_checkpoint_load,
     resolve_megatron_config,
 )
+from miles.backends.primus_utils.config_bridge import PrimusConfigBridge, add_primus_arguments
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
@@ -2511,6 +2512,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
             )
+            add_primus_arguments(parser)
             return parser
 
         def add_mtp_training_arguments(parser):
@@ -2777,10 +2779,17 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
     add_miles_arguments = get_miles_extra_args_provider(add_custom_arguments)
 
     backend = parse_args_train_backend()
+    primus_bridge = PrimusConfigBridge.from_argv()
+    assert (
+        primus_bridge is None or backend == "megatron"
+    ), f"--primus-config requires --train-backend megatron, got '{backend}'"
     if backend == "megatron":
         from miles.backends.megatron_utils.arguments import parse_args as megatron_parse_args
         from miles.backends.megatron_utils.arguments import set_default_megatron_args
         from miles.backends.megatron_utils.arguments import validate_args as megatron_validate_args
+
+        if primus_bridge is not None:
+            add_miles_arguments = primus_bridge.wrap_extra_args_provider(add_miles_arguments)
 
         args = megatron_parse_args(extra_args_provider=add_miles_arguments)
         args.compress_ratios = None
@@ -2803,6 +2812,8 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
         args.rank = 0
         args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
         args = set_default_megatron_args(args)
+        if primus_bridge is not None:
+            args = primus_bridge.attach(args)
     else:
         from miles.backends.fsdp_utils.arguments import load_fsdp_args
 
