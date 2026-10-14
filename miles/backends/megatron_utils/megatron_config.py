@@ -375,6 +375,12 @@ def resolve_args_checkpoint_load(args: Namespace) -> None:
                 args.ckpt_step = args.ref_ckpt_step
             args.start_rollout_id = 0
 
+    # A weights-only checkpoint has no Adam state to restore. Leaving
+    # --finetune set loads those weights and then restarts the run at step 0.
+    if _has_megatron_checkpoint(args.requested_load) and getattr(args, "no_save_optim", False):
+        args.finetune = False
+        args.no_load_optim = True
+
 
 def _has_megatron_checkpoint(load_dir: str | None) -> bool:
     return (
