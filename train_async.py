@@ -62,6 +62,14 @@ async def train(args, *, disposer: Disposer):
     eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
     disposer.add(eval_dispatcher.drain)
 
+    if os.environ.get("MILES_EVAL_ONLY") == "1":
+        # Evaluate the loaded weights (HF or --load checkpoint) once, then exit without training.
+        await inference_controller.prepare_eval()
+        await eval_dispatcher.dispatch(args.start_rollout_id, hf_dir=args.hf_checkpoint, force=True)
+        await eval_dispatcher.drain()
+        logger.info("eval-only run complete at rollout %s", args.start_rollout_id)
+        return
+
     if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
         await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)

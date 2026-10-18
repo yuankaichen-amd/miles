@@ -137,7 +137,7 @@ class TrainRayActor(NodeProbeMixin):
             backend=backend,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
         )
-        init_gloo_group()
+        init_gloo_group(timeout=timedelta(minutes=args.distributed_timeout_minutes))
 
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()

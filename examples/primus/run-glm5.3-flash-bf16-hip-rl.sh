@@ -34,21 +34,54 @@ export HIP_KERNEL_TOOL_SERVER_URL=${HIP_KERNEL_TOOL_SERVER_URL:-${SF_URL%/run_co
 export HIP_MAX_SEQ_LEN=${SGLANG_CONTEXT_LEN}
 
 export SGLANG_USE_AITER=1
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
-export SGLANG_OPT_USE_TILELANG_MHC_PRE=0
-export SGLANG_OPT_USE_TILELANG_MHC_POST=0
-export SGLANG_OPT_FUSE_MHC_POST_PRE=0
-export SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=0
+# rocm: MI300 branch (SGLANG_DIR) with TileLang DSA, AITER MoE and decode CUDA graphs.
+# legacy: image SGLang plus the torch KPool fallbacks, CUDA graphs off.
+SGLANG_PROFILE=${SGLANG_PROFILE:-legacy}
+if [ "${SGLANG_PROFILE}" = rocm ]; then
+  export AITER_ONLINE_TUNE=0 HIP_FORCE_DEV_KERNARG=1
+  SGLANG_PROFILE_ARGS=(--sglang-dsa-prefill-backend tilelang --sglang-dsa-decode-backend tilelang
+    --sglang-moe-runner-backend aiter --sglang-cuda-graph-max-bs-decode 128)
+else
+  export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
+  export SGLANG_OPT_USE_TILELANG_MHC_PRE=0
+  export SGLANG_OPT_USE_TILELANG_MHC_POST=0
+  export SGLANG_OPT_FUSE_MHC_POST_PRE=0
+  export SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD=0
+  SGLANG_PROFILE_ARGS=()
+fi
 
 case "${TRAIN_NODES}" in
   4) PP_ARGS=(--pipeline-model-parallel-size 4 --decoder-first-pipeline-num-layers 12 --decoder-last-pipeline-num-layers 11) ;;
-  *) echo "HIP RL expects TRAIN_NODES=4" >&2; exit 1 ;;
+  # 5 + 6x6 + 4 layers; the last stage also holds the LM head.
+  8) PP_ARGS=(--pipeline-model-parallel-size 8 --decoder-first-pipeline-num-layers 5 --decoder-last-pipeline-num-layers 4) ;;
+  *) echo "HIP RL expects TRAIN_NODES=4 or 8" >&2; exit 1 ;;
 esac
 
 cd "${MILES_DIR}"
 
+DATA_ORDER_ARGS=()
+[ "${ROLLOUT_SHUFFLE:-1}" = 1 ] && DATA_ORDER_ARGS+=(--rollout-shuffle)
+[ "${SKIP_EVAL_BEFORE_TRAIN:-1}" = 1 ] && DATA_ORDER_ARGS+=(--skip-eval-before-train)
+RADIX_ARGS=()
+[ "${SGLANG_RADIX_CACHE:-0}" = 1 ] || RADIX_ARGS+=(--sglang-disable-radix-cache)
+
+# CP_SIZE>1 packs THD and splits each sequence contiguously across the CP ranks
+# (needs the Primus THD/CP attention changes). CP and EP fold onto the same GPUs.
+CP_SIZE=${CP_SIZE:-1}
+if [ "${CP_SIZE}" -gt 1 ]; then
+  MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-4096}
+  PACKED_LEN=$(( MAX_TOKENS_PER_GPU * CP_SIZE ))
+  [ "${PACKED_LEN}" -ge "${SGLANG_CONTEXT_LEN}" ] || { echo "MAX_TOKENS_PER_GPU*CP_SIZE < ${SGLANG_CONTEXT_LEN}" >&2; exit 1; }
+  export K3P_KDA_CONV=${K3P_KDA_CONV:-fla} PRIMUS_DSA_BWD_BLOCK_H=${PRIMUS_DSA_BWD_BLOCK_H:-32}
+  SEQ_ARGS=(--context-parallel-size "${CP_SIZE}" --qkv-format thd --allgather-cp
+    --use-dynamic-batch-size --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+    --primus-override seq_length=${PACKED_LEN} max_position_embeddings=${PACKED_LEN})
+else
+  SEQ_ARGS=(--context-parallel-size 1 --qkv-format bshd)
+fi
+
 CUDA_GRAPH_ARGS=(--sglang-disable-cuda-graph)
-[ "${SGLANG_CUDA_GRAPH:-0}" = 1 ] && CUDA_GRAPH_ARGS=()
+[ "${SGLANG_CUDA_GRAPH:-0}" = 1 ] || [ "${SGLANG_PROFILE}" = rocm ] && CUDA_GRAPH_ARGS=()
 
 export HSA_NO_SCRATCH_RECLAIM=1
 
@@ -59,6 +92,9 @@ if os.environ.get("TRAIN_PYTORCH_ALLOC_CONF"):
     env["PYTORCH_ALLOC_CONF"] = os.environ["TRAIN_PYTORCH_ALLOC_CONF"]
 if os.environ.get("TURBO_PYTHONPATH"):
     env["PYTHONPATH"] = os.environ["TURBO_PYTHONPATH"] + ":" + os.environ["PYTHONPATH"]
+for key in ("K3P_KDA_CONV", "PRIMUS_DSA_DKV_SAFE", "PRIMUS_DSA_BWD_BLOCK_H", "PRIMUS_DSA_BWD_NUM_STAGES"):
+    if os.environ.get(key):
+        env[key] = os.environ[key]
 env.update({k: v for k, v in os.environ.items() if k.startswith(("TORCH_DISTRIBUTED_", "TORCH_NCCL_"))})
 print(json.dumps(env))
 EOF
@@ -66,8 +102,9 @@ EOF
 
 RUNTIME_ENV_JSON=$(python3 - <<'EOF'
 import json, os
-prefixes = ("SGLANG_", "NCCL_", "GLOO_", "TP_SOCKET_", "RAY_EXPERIMENTAL_", "PRIMUS_", "MILES_", "REWARD_", "HIP_")
+prefixes = ("SGLANG_", "NCCL_", "GLOO_", "TP_SOCKET_", "RAY_EXPERIMENTAL_", "PRIMUS_", "MILES_", "REWARD_", "HIP_", "AITER_", "K3P_")
 keys = ["PYTHONPATH", "LD_LIBRARY_PATH", "PATH", "GLM5_TOKENIZER", "CUDA_DEVICE_MAX_CONNECTIONS", "HSA_NO_SCRATCH_RECLAIM",
+        "HIP_FORCE_DEV_KERNARG",
         "MASTER_ADDR", "no_proxy", "PYTHONUNBUFFERED", "TRITON_CACHE_DIR", "SF_URL"]
 env = {k: v for k, v in os.environ.items() if k in keys or k.startswith(prefixes)}
 print(json.dumps({"env_vars": env}))
@@ -86,7 +123,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --prompt-data "${HIP_TRAIN}" \
   --input-key prompt \
   --label-key label \
-  --rollout-shuffle \
+  "${DATA_ORDER_ARGS[@]}" \
   --use-session-server \
   --tito-model glm53 \
   --custom-generate-function-path hip_agent.generate \
@@ -96,10 +133,11 @@ ray job submit --address="http://127.0.0.1:8265" \
   --sglang-reasoning-parser glm45 \
   --sglang-tool-call-parser glm47 \
   --custom-rm-path hip_reward.compute_reward \
+  --custom-rollout-log-function-path hip_agent.log_rollout_metrics \
   --num-rollout "${NUM_ROLLOUT:-100}" \
   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-8}" \
-  --n-samples-per-prompt 8 \
-  --global-batch-size "$(( ${ROLLOUT_BATCH_SIZE:-8} * 8 ))" \
+  --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}" \
+  --global-batch-size "$(( ${ROLLOUT_BATCH_SIZE:-8} * ${N_SAMPLES_PER_PROMPT:-8} ))" \
   --rollout-max-response-len "${RESPONSE_LEN}" \
   --rollout-max-prompt-len "${PROMPT_LEN}" \
   --rollout-max-context-len "${SGLANG_CONTEXT_LEN}" \
@@ -111,7 +149,9 @@ ray job submit --address="http://127.0.0.1:8265" \
   --n-samples-per-eval-prompt 1 \
   --eval-max-response-len "${RESPONSE_LEN}" \
   --eval-top-k 1 \
-  --skip-eval-before-train \
+  --fully-async \
+  --async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES:-128}" \
+  --rollout-submission-granularity group \
   --advantage-estimator grpo \
   --use-rollout-routing-replay \
   --kl-coef 0.00 \
@@ -120,7 +160,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --eps-clip-high 0.28 \
   --use-tis \
   --optimizer adam \
-  --lr 1e-6 \
+  --lr 3e-6 \
   --lr-decay-style constant \
   --weight-decay 0.1 \
   --adam-beta1 0.9 \
@@ -128,15 +168,15 @@ ray job submit --address="http://127.0.0.1:8265" \
   --optimizer-cpu-offload \
   --overlap-cpu-optimizer-d2h-h2d \
   --use-precision-aware-optimizer \
+  --no-save-optim \
   --tensor-model-parallel-size 1 \
   "${PP_ARGS[@]}" \
-  --context-parallel-size 1 \
+  "${SEQ_ARGS[@]}" \
   --expert-model-parallel-size 8 \
   --expert-tensor-parallel-size 1 \
   --recompute-granularity full \
   --recompute-method uniform \
   --recompute-num-layers 1 \
-  --qkv-format bshd \
   --micro-batch-size 1 \
   --no-gradient-accumulation-fusion \
   --attention-dropout 0.0 \
@@ -147,8 +187,9 @@ ray job submit --address="http://127.0.0.1:8265" \
   --rollout-num-gpus-per-engine 8 \
   --sglang-mem-fraction-static 0.8 \
   "${CUDA_GRAPH_ARGS[@]}" \
-  --sglang-disable-radix-cache \
-  --sglang-max-running-requests 64 \
+  "${SGLANG_PROFILE_ARGS[@]}" \
+  "${RADIX_ARGS[@]}" \
+  --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS:-128}" \
   --sglang-chunked-prefill-size 16384 \
   --sglang-context-length "${SGLANG_CONTEXT_LEN}" \
   --actor-num-nodes "${TRAIN_NODES}" \
