@@ -272,3 +272,11 @@ def test_generate_marks_dropped_episodes_aborted(monkeypatch):
         out = run(hip_cc_agent.generate(SimpleNamespace(sample=sample)))
         assert sample.metadata["task_id"] == LABEL["task_id"]
         assert out.samples[0].status == expected
+
+
+def test_label_sets_the_kb_and_counters_cell(tmp_path):
+    agent, _ = make_agent(tmp_path, FakeCluster(RUNNER_OK), [])
+    spec = agent.episode_spec("e", "tok", LABEL)
+    assert spec["kb"] is True and spec["counters_enabled"] is True
+    spec = agent.episode_spec("e", "tok", {**LABEL, "kb": False, "counters": False})
+    assert spec["kb"] is False and spec["counters_enabled"] is False

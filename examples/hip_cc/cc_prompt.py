@@ -14,10 +14,18 @@ PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 CHEATSHEETS = ("MI355X_architecture.md", "hip_cheatsheet.md")
 
 
+KB_CLAUSES = (" and read `/kb/common_methodology/profiling/counters.md`",)
+
+
 def hardware_context(with_kb: bool = True) -> str:
     parts = [re.sub(r"^<!--.*?-->\n", "", (PROMPT_DIR / name).read_text(), flags=re.S) for name in CHEATSHEETS]
     text = "\n\n---\n\n".join(parts)
-    if with_kb:
+    if not with_kb:
+        for clause in KB_CLAUSES:
+            text = text.replace(clause, "")
+        if "/kb" in text:
+            raise ValueError("a cheat sheet mentions /kb outside KB_CLAUSES")
+    else:
         text += ("\n\n---\n\nDeeper reference cards on MI355X hardware, bottleneck triage, optimization levers and HIP "
                  "are in /kb (read-only). Start at /kb/INDEX.md and open a card only when it is relevant.\n")
     return text
@@ -25,6 +33,10 @@ def hardware_context(with_kb: bool = True) -> str:
 
 def build_prompt(workspace: Path, *, with_kb: bool = True) -> str:
     readme = (workspace / "README.md").read_text()
+    if not with_kb:
+        from cc_workspace import KB_POINTER  # noqa: PLC0415
+
+        readme = readme.replace(KB_POINTER, "")
     task_id = readme.splitlines()[0].removeprefix("# ").strip()
     lines = [
         f"Task: {task_id}",

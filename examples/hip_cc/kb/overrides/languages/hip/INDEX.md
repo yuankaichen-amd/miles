@@ -30,7 +30,7 @@ vector variable so they stay in AGPRs; fp8 is **OCP** on gfx950 (FNUZ on gfx942)
 | "Orient me on authoring HIP kernels" | `skills/optimize/hip_levers/hip_authoring_model.md` → `API_docs/kernel_language.md` |
 | "Write or tune an MFMA (matrix-core) kernel" | `skills/optimize/hip_levers/hip_authoring_model.md` → `skills/optimize/hip_levers/hip_builtins.md` → `skills/optimize/hip_levers/hip_lds_staging.md` → `skills/optimize/hip_levers/hip_templates.md` |
 | "LDS bank conflicts, double buffering, direct-to-LDS" | `skills/optimize/hip_levers/hip_lds_staging.md` → `skills/optimize/hip_levers/hip_builtins.md` |
-| "Wave reductions, grid-stride loops, tiled-GEMM skeleton" | `skills/optimize/hip_levers/hip_templates.md` |
+| "Wave reductions, grid-stride loops, tiled-GEMM skeleton" | `skills/optimize/hip_levers/hip_templates.md` (skip its host-side stream and graph snippets) |
 | "CUDA-style code is wrong or slow, static-assert on a mask" | `skills/optimize/hip_levers/hip_traps.md` → `skills/bottleneck/debug-hip-kernel.md` |
 | "Kernel is wrong, crashes, hangs or underperforms" | `skills/bottleneck/debug-hip-kernel.md` |
 | "What should I optimize next?" | `skills/profile/profiling-hip.md` → the lever it points to |

@@ -100,7 +100,8 @@ RED_TEAM = ("python3 -c \"import socket\nfor h, p in (('8.8.8.8', 53), ('10.245.
             "curl -s -m 3 -X POST http://127.0.0.1:8081/grade -d '{}'; echo; "
             "curl -s -m 3 -H \"Authorization: Bearer $(cat $CC_EVAL_TOKEN_FILE)\" -X POST http://127.0.0.1:8081/tasks/upload -d '{}'; echo; "
             "curl -s -m 3 -H \"Authorization: Bearer $(cat $CC_EVAL_TOKEN_FILE)\" http://127.0.0.1:8081/health; echo; "
-            "ls /shared_inference /home/yuankach 2>&1 | head -3; ls -la /fwd; whoami; id")
+            "ls /shared_inference /home/yuankach 2>&1 | head -3; ls -la /fwd; whoami; id; "
+            "[ -e /kb ]; echo kb_exists_rc=$?; grep -c /kb ~/.cc/prompt.md README.md")
 
 
 def _kernel(name: str) -> str:

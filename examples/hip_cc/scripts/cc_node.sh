@@ -6,6 +6,8 @@
 #   CC_SECRETS_DIR    0700 directory with runner_token and gateway_admin_token (0600), made by the sbatch
 #   CC_CONTAINERS_PER_NODE, CC_IMAGE_TAG (default: the published LATEST), CC_TOKENIZER (HF dir, optional)
 #   CC_EXPECTED_IMAGE_ID  default: the published <tag>.image_id
+#   CC_KB_OFF_IMAGE=1     also verify hip-cc-rollout-nokb (LATEST-nokb, or CC_IMAGE_TAG_NOKB) and give it
+#                         to the runner for /kb-off episodes (Phase 0b only; Phase 0a runs one image)
 #   HIP_SF_URL_FILE, HIP_SANDBOX_TOKEN_FILE   Crusoe relay URLs and grader token (paths only)
 #   DRY_RUN=1         print what would run and exit
 #
@@ -36,40 +38,58 @@ NODE_LOG=$CC_RUN_DIR/nodes/$HOST
 GW_NAME=cc_gw_$JOB
 CTX=$IMAGES/hip-cc-rollout/$CTX_TAG.context.tar
 EXPECTED_ID=${CC_EXPECTED_IMAGE_ID:-$(cat "$IMAGES/hip-cc-rollout/$CTX_TAG.image_id" 2>/dev/null || true)}
+KB_OFF=${CC_KB_OFF_IMAGE:-0}
+NOKB_TAG=${CC_IMAGE_TAG_NOKB:-$(cat "$IMAGES/hip-cc-rollout/LATEST-nokb" 2>/dev/null || echo unpublished)}
+NOKB_EXPECTED_ID=$(cat "$IMAGES/hip-cc-rollout/$NOKB_TAG.image_id" 2>/dev/null || true)
 log() { echo "[cc_node $HOST $(date -u +%T)] $*"; }
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
   log "role: cc-runner http://$NODE_IP:$RUNNER_PORT (capacity $CAP, image hip-cc-rollout:$CTX_TAG)," \
       "cc-gateway http://$NODE_IP:$GW_PORT (container $GW_NAME), sockets $SOCK_ROOT, logs $NODE_LOG," \
-      "required image ID ${EXPECTED_ID:-<none published>}"
+      "required image ID ${EXPECTED_ID:-<none published>}" \
+      "$([ "$KB_OFF" = 1 ] && echo "; /kb-off image hip-cc-rollout-nokb:$NOKB_TAG ${NOKB_EXPECTED_ID:-<none published>}")"
   exit 0
 fi
 
 [ "$CTX_TAG" != unpublished ] || { log "no published image context under $IMAGES/hip-cc-rollout"; exit 1; }
 [[ "$EXPECTED_ID" == sha256:* ]] || { log "no published image ID for $CTX_TAG; refusing to start"; exit 1; }
+if [ "$KB_OFF" = 1 ]; then
+  [[ "$NOKB_EXPECTED_ID" == sha256:* ]] || { log "no published /kb-off image ID; refusing to start"; exit 1; }
+fi
 mkdir -p "$NODE_LOG"
 for f in runner_token gateway_admin_token; do
   [ "${1:-}" = verify ] && break
   [ "$(stat -c %a "$CC_SECRETS_DIR/$f")" = 600 ] || { log "$CC_SECRETS_DIR/$f must be mode 0600"; exit 1; }
 done
 
-(
-  flock 9
-  docker image inspect "$BASE" >/dev/null 2>&1 || docker load -q -i "$BASE_TAR"
-  have=$(docker image inspect -f '{{.Id}}' "hip-cc-rollout:$CTX_TAG" 2>/dev/null || true)
-  if [ "$have" != "$EXPECTED_ID" ]; then
-    (cd "$(dirname "$CTX")" && sha256sum -c --quiet "$CTX_TAG.context.tar.sha256")
-    log "building hip-cc-rollout:$CTX_TAG from $CTX (had ${have:-none})"
-    docker image rm -f "hip-cc-rollout:$CTX_TAG" >/dev/null 2>&1 || true
-    "$HC/image/build_from_context.sh" "$CTX" "hip-cc-rollout:$CTX_TAG" "$BASE" >/dev/null
+ensure_image() {  # ensure_image <repo> <tag> <expected id>: rebuild if needed, then require the ID
+  local repo=$1 tag=$2 want=$3 have ctx=$IMAGES/hip-cc-rollout/$2.context.tar
+  (
+    flock 9
+    docker image inspect "$BASE" >/dev/null 2>&1 || docker load -q -i "$BASE_TAR"
+    have=$(docker image inspect -f '{{.Id}}' "$repo:$tag" 2>/dev/null || true)
+    if [ "$have" != "$want" ]; then
+      (cd "$(dirname "$ctx")" && sha256sum -c --quiet "$tag.context.tar.sha256")
+      log "building $repo:$tag from $ctx (had ${have:-none})"
+      docker image rm -f "$repo:$tag" >/dev/null 2>&1 || true
+      "$HC/image/build_from_context.sh" "$ctx" "$repo:$tag" "$BASE" >/dev/null
+    fi
+  ) 9>"/tmp/cc-image-$(id -u).lock"
+  have=$(docker image inspect -f '{{.Id}}' "$repo:$tag" 2>/dev/null || true)
+  if [ "$have" != "$want" ]; then
+    log "image $repo:$tag ID ${have:-missing} != published $want; this node runs no containers"
+    exit 1
   fi
-) 9>"/tmp/cc-image-$(id -u).lock"
-IMAGE_ID=$(docker image inspect -f '{{.Id}}' "hip-cc-rollout:$CTX_TAG" 2>/dev/null || true)
-if [ "$IMAGE_ID" != "$EXPECTED_ID" ]; then
-  log "image ID ${IMAGE_ID:-missing} != published $EXPECTED_ID; this node runs no containers"
-  exit 1
+  log "image $repo:$tag verified: $have"
+}
+
+ensure_image hip-cc-rollout "$CTX_TAG" "$EXPECTED_ID"
+IMAGE_ID=$EXPECTED_ID
+NOKB_ARGS=()
+if [ "$KB_OFF" = 1 ]; then
+  ensure_image hip-cc-rollout-nokb "$NOKB_TAG" "$NOKB_EXPECTED_ID"
+  NOKB_ARGS=(--image-nokb "$NOKB_EXPECTED_ID")
 fi
-log "image hip-cc-rollout:$CTX_TAG verified: $IMAGE_ID"
 [ "${1:-}" = verify ] && exit 0
 
 cleanup() {
@@ -94,7 +114,7 @@ docker run -d --name "$GW_NAME" --network host --user "$(id -u):$(id -g)" \
   >/dev/null
 
 export CC_CONTAINER_LABEL="cc.job=$JOB"
-python3 "$HC/cc_runner.py" --host "$NODE_IP" --port "$RUNNER_PORT" --image "$IMAGE_ID" \
+python3 "$HC/cc_runner.py" --host "$NODE_IP" --port "$RUNNER_PORT" --image "$IMAGE_ID" "${NOKB_ARGS[@]}" \
   --capacity "$CAP" --token-file "$CC_SECRETS_DIR/runner_token" --sock-root "$SOCK_ROOT" \
   --log-root "$NODE_LOG/episodes" > "$NODE_LOG/runner.log" 2>&1 &
 RUNNER_PID=$!

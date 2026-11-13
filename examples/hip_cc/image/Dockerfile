@@ -1,6 +1,7 @@
 # hip-cc-rollout: the Claude Code rollout container (plan §4.2).
 # gfx950 hipcc and a ROCm torch for local builds (no GPU), the pinned Claude Code binary,
-# the aka-eval shim and the read-only /kb. Built by build_image.sh from a context it stages.
+# the aka-eval shim and the read-only /kb (left out of hip-cc-rollout-nokb: its context has an
+# empty kb/, removed below). Built by build_image.sh from the contexts it stages.
 ARG BASE=rocm/sgl-dev:miles-rocm10-mi30x-20261001
 FROM ${BASE}
 
@@ -17,7 +18,8 @@ RUN set -eux; \
     bitcode=$(find "$(readlink -f /opt/rocm)/" -type d -name bitcode -path '*amdgcn*' | head -1); \
     test -n "$bitcode"; ln -s "$bitcode" /opt/cc/bitcode; \
     mkdir -p /workspace /home/agent; \
-    chmod 0777 /workspace /home/agent
+    chmod 0777 /workspace /home/agent; \
+    if [ -z "$(ls -A /kb)" ]; then rmdir /kb; fi
 
 # hipcc resolves its install from these instead of /root (unreadable for the non-root agent).
 ENV ROCM_PATH=/opt/rocm \

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import io
 import json
 import sys
+import tarfile
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -316,3 +318,26 @@ def test_claude_env_and_run_script_carry_no_secret(tmp_path):
     assert env["ANTHROPIC_BASE_URL"].endswith("/e/ep1")
     script = cc_runner.RUN_SH
     assert "--disallowedTools" in script and "gw_token" in script
+
+
+def test_kb_off_episode_hides_every_kb_pointer(tmp_path):
+    from cc_workspace import KB_POINTER  # noqa: PLC0415
+
+    proxy = make_proxy(tmp_path, FakeClient())
+    ws = Path(proxy.spec.workspace_dir)
+    (ws / "README.md").write_text(f"# t2h/x/y\n\nintro\n\n{KB_POINTER}## Interface\n\nrun\n")
+    assert "/kb" in cc_runner.build_prompt(ws)
+    assert "/kb" not in cc_runner.build_prompt(ws, with_kb=False)
+
+    def readme(data):
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            return tar.extractfile("README.md").read().decode()
+
+    assert "/kb" in readme(cc_runner.workspace_tar(ws))
+    off = readme(cc_runner.workspace_tar(ws, with_kb=False))
+    assert "/kb" not in off and "## Interface" in off
+    body = {"episode": "e", "task_id": "t", "task_version": "v", "workspace_dir": str(ws), "gateway_url": "u",
+            "gateway_token": "x", "model": "m", "kb": False, "prompt": "see /kb/INDEX.md"}
+    with pytest.raises(cc_http.HTTPError):
+        cc_runner.EpisodeSpec.from_json(body)
+    assert cc_runner.EpisodeSpec.from_json({**body, "prompt": ""}).kb is False

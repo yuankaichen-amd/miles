@@ -80,6 +80,7 @@ def main() -> int:
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--wall-s", type=int, default=900)
+    parser.add_argument("--image-nokb", default=None, help="Run the episode as a /kb-off arm on this image.")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -110,7 +111,8 @@ def main() -> int:
                         "-v", f"{out}:{out}", "-v", f"{secret_dir}:{secret_dir}:ro", DEV_IMAGE, "bash", "-c", inner],
                        check=True, stdout=subprocess.DEVNULL)
         procs.append(subprocess.Popen([sys.executable, str(ROOT / "cc_runner.py"), "--host", "127.0.0.1", "--port",
-                                       str(runner_port), "--image", args.image, "--capacity", "4", "--token-file",
+                                       str(runner_port), "--image", args.image,
+                                       *(["--image-nokb", args.image_nokb] if args.image_nokb else []), "--capacity", "4", "--token-file",
                                        str(secret_dir / "runner_token"), "--sock-root", f"/tmp/cc-sock-dry-{os.getpid()}",
                                        "--log-root", str(out / "episodes")],
                                       env=env, stdout=open(out / "runner.txt", "w"), stderr=subprocess.STDOUT))
@@ -126,7 +128,7 @@ def main() -> int:
             "episode": episode, "task_id": "t2h/cudaagent/fused_torch_1_relu6_72ecee24",
             "task_version": "6e0402dbba69efa9", "workspace_dir": args.workspace,
             "gateway_url": f"http://127.0.0.1:{gw_port}", "gateway_token": token, "model": SERVED,
-            "wall_s": args.wall_s})
+            "wall_s": args.wall_s, "kb": not args.image_nokb})
         print("start:", reply, flush=True)
         result = {}
         while time.time() - started < args.wall_s + 300:
@@ -173,6 +175,8 @@ def main() -> int:
         "red_team_blocked": not re.search(r"REACHED \d", stream) and len(re.findall(r"blocked \d", stream)) >= 3,
         "no_host_paths": "cannot access '/shared_inference'" in stream and "cannot access '/home/yuankach'" in stream,
         "grader_saw_no_code_in_log": all("code" not in g for g in grader_log),
+        "kb_as_expected": ("kb_exists_rc=1" in stream and "prompt.md:0" in stream and "README.md:0" in stream)
+        if args.image_nokb else ("kb_exists_rc=0" in stream and "README.md:1" in stream),
         "denials_in_host_log": {(d["event"], d.get("path")) for d in runner_denials} >= HOST_DENIALS_EXPECTED
         and any(d["event"] == "gateway_denied" and "/../" in d.get("path", "") for d in runner_denials),
         "gateway_calls": gateway.get("calls"),

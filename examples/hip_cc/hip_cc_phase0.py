@@ -2,7 +2,8 @@
 
 For each task row and sample it opens a session on the standalone session server v2, runs
 ``hip_cc_agent.Agent.run`` against it, records the session tree summary and the episode result,
-and deletes the session. Rows come from ``$CC_TASKS`` (``t2h_manifest.py workspaces`` output).
+and deletes the session. Rows come from ``$CC_TASKS`` (``t2h_manifest.py workspaces`` output) and must
+all be train tasks: eval128 and heldout150 stay untouched for evaluation.
 
     CC_TASKS, CC_TASK_LIMIT (0 = all), CC_SAMPLES, CC_CONCURRENCY, CC_SESSION_URLS (comma list,
     one session server per rollout node; episodes go round-robin), CC_OUT,
@@ -31,6 +32,9 @@ logger = logging.getLogger("hip_cc_phase0")
 def load_rows(path: str, limit: int) -> list[dict]:
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     rows = [{**(row.get("label") or {}), **{k: v for k, v in row.items() if k != "label"}} for row in rows]
+    off_split = sorted({str(row.get("split")) for row in rows if row.get("split") != "train"})
+    if off_split:
+        raise SystemExit(f"Phase 0 samples train tasks only; {path} has splits {off_split}")
     return rows[:limit] if limit > 0 else rows
 
 

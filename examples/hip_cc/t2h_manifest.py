@@ -1,10 +1,19 @@
 """The gfx950-validated task lists for rollouts (phase 0a start condition 4).
 
     python3 t2h_manifest.py fetch [--version V]      save GET /tasks/manifest?version=V
+    python3 t2h_manifest.py topup [--manifest F]      plan the t2h-eval128 top-up from the ranked reserve
     python3 t2h_manifest.py workspaces [--manifest F] render validated tasks and write
                                                       $DATA/t2h/workspaces/<split>/manifest.jsonl
 
-``workspaces`` keeps only tasks the Crusoe manifest marks valid, in the order of the P2 index.
+``workspaces`` keeps only tasks the Crusoe manifest marks valid with every one of the manifest's
+``rules.runs`` baseline runs present (on as many timing nodes), in the order of the P2 index.
+
+``topup`` replaces each dropped t2h-eval128 pick with a reserve task of the same source, same
+difficulty first, in the P2 ``eval128_topup_rank`` order. The pick is the first candidate in that
+order that is not dropped; a pending one holds the slot (no skipping ahead to a task that happens to
+have finished validation first). It writes ``$DATA/t2h/eval128-topup-latest.json``; ``workspaces``
+moves the promoted tasks that passed into the t2h-eval128 list, and only once the plan is complete
+(every slot filled by a passed task and no original pick still pending) is t2h-eval128 final.
 Each one is rendered once with ``cc_workspace.render_workspace`` (the only path from the task
 store to an agent) into ``$DATA/t2h/workspaces/<split>/<name>/``. Manifest rows are Miles
 prompt-data rows: ``{"prompt": task_id, "label": {task_id, split, source, task_version,
@@ -34,6 +43,82 @@ URL_FILE = os.environ.get("HIP_SF_URL_FILE", "/shared_inference/yuankach/glm53/h
 TOKEN_FILE = os.environ.get("HIP_SANDBOX_TOKEN_FILE") or os.environ.get(
     "HIP_SF_TOKEN_FILE", os.path.expanduser("~/.hip_cc/crusoe_grader_token"))
 VALID_STATUS = ("valid",)
+TOPUP_PLAN = DATA / "t2h" / "eval128-topup-latest.json"
+
+
+def passed_all_runs(task: dict | None, runs: int) -> bool:
+    if not task or task.get("status") not in VALID_STATUS:
+        return False
+    baseline = task.get("baseline") or {}
+    return (len(task.get("timing_nodes") or []) >= runs and bool(baseline)
+            and all(len(w.get("runs_ms") or []) >= runs for w in baseline.values()))
+
+
+def topup_meta(package: Path, splits=("t2h-eval128", "reserve")) -> dict[str, dict]:
+    """difficulty and eval128_topup_rank from each task's t2h.json; no other member is read."""
+    import re  # noqa: PLC0415
+    import tarfile  # noqa: PLC0415
+
+    wanted = re.compile(r"(?:^|/)tasks/(%s)/[^/]+/[^/]+/t2h\.json$" % "|".join(map(re.escape, splits)))
+    meta = {}
+    with tarfile.open(package) as tar:
+        for member in tar:
+            if member.isfile() and wanted.search(member.name):
+                data = json.loads(tar.extractfile(member).read())
+                meta[data["task_id"]] = {"difficulty": data.get("difficulty"),
+                                         "rank": data.get("eval128_topup_rank"), "source": data.get("source")}
+    return meta
+
+
+def topup(manifest_path: Path, version: str) -> dict:
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("version") != version:
+        raise SystemExit(f"manifest version {manifest.get('version')} != {version}")
+    runs = int((manifest.get("rules") or {}).get("runs", 3))
+    tasks = {t["task_id"]: t for t in manifest["tasks"]}
+    meta = topup_meta(DATA / "t2h" / f"t2h-{version}.tar.gz")
+    rows = [json.loads(line) for line in (DATA / "t2h" / "store" / version / "index.jsonl").read_text().splitlines()
+            if line.strip()]
+
+    def state(task_id: str) -> str:
+        task = tasks.get(task_id) or {}
+        if passed_all_runs(task, runs):
+            return "passed"
+        return "dropped" if task.get("status") == "dropped" else "pending"
+
+    slots, pending_picks, validate_next = [], [], []
+    for source in ("cudaagent", "gpumode"):
+        picks = [r["task_id"] for r in rows if r["split"] == "t2h-eval128" and r["source"] == source]
+        lost = [t for t in picks if state(t) == "dropped"]
+        pending_picks += [t for t in picks if state(t) == "pending"]
+        pool = sorted((r["task_id"] for r in rows if r["split"] == "reserve" and r["source"] == source
+                       and meta.get(r["task_id"], {}).get("rank") is not None),
+                      key=lambda t: meta[t]["rank"])
+        taken: set[str] = set()
+        for task_id in lost:
+            difficulty = meta.get(task_id, {}).get("difficulty")
+            open_pool = [t for t in pool if t not in taken and state(t) != "dropped"]
+            same = [t for t in open_pool if meta[t]["difficulty"] == difficulty]
+            pick = (same or open_pool or [None])[0]
+            if pick:
+                taken.add(pick)
+            slots.append({"replaces": task_id, "source": source, "difficulty": difficulty, "task_id": pick,
+                          "rank": meta[pick]["rank"] if pick else None,
+                          "same_difficulty": bool(same), "state": state(pick) if pick else "no_candidate"})
+        # What validation should finish first: each unfilled pick plus two backups in rank order.
+        unfilled = [s for s in slots if s["source"] == source and s["state"] != "passed"]
+        spare = [t for t in pool if t not in taken and state(t) == "pending"]
+        validate_next += [s["task_id"] for s in unfilled if s["task_id"]] + spare[: 2 * len(unfilled)]
+    plan = {"version": version, "manifest": manifest_path.name, "generated_at": manifest.get("generated_at"),
+            "runs": runs, "slots": slots, "eval128_pending": len(pending_picks), "validate_next": validate_next,
+            "complete": not pending_picks and all(s["state"] == "passed" for s in slots)}
+    tmp = TOPUP_PLAN.with_suffix(".tmp")
+    tmp.write_text(json.dumps(plan, indent=1) + "\n")
+    tmp.replace(TOPUP_PLAN)
+    counts = collections.Counter(s["state"] for s in slots)
+    print(f"eval128 top-up: {len(slots)} dropped picks -> {dict(counts)}; {len(pending_picks)} original picks "
+          f"still pending; complete={plan['complete']} -> {TOPUP_PLAN}")
+    return plan
 
 
 def read_token(path: str = TOKEN_FILE) -> str:
@@ -79,7 +164,14 @@ def workspaces(manifest_path: Path, version: str) -> None:
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("version") != version:
         raise SystemExit(f"manifest version {manifest.get('version')} != {version}")
+    runs = int((manifest.get("rules") or {}).get("runs", 3))
+    tasks = {t["task_id"]: t for t in manifest["tasks"]}
     status = {t["task_id"]: t.get("status") for t in manifest["tasks"]}
+    plan = json.loads(TOPUP_PLAN.read_text()) if TOPUP_PLAN.exists() else {}
+    if plan and plan.get("generated_at") != manifest.get("generated_at"):
+        print(f"top-up plan is for the manifest of {plan.get('generated_at')}; rerun topup on this one first")
+        plan = {}
+    promoted = {s["task_id"]: s["replaces"] for s in plan.get("slots", []) if s.get("state") == "passed"}
     index = DATA / "t2h" / "store" / version / "index.jsonl"
     rows = [json.loads(line) for line in index.read_text().splitlines() if line.strip()]
     from cc_workspace import render_workspace  # noqa: PLC0415
@@ -89,17 +181,20 @@ def workspaces(manifest_path: Path, version: str) -> None:
     by_split: dict[str, list[dict]] = collections.defaultdict(list)
     rendered = 0
     for row in rows:
-        if status.get(row["task_id"]) not in VALID_STATUS:
+        if not passed_all_runs(tasks.get(row["task_id"]), runs):
             continue
-        workspace = root / row["split"] / row["task_id"].rsplit("/", 1)[-1]
+        split = "t2h-eval128" if row["task_id"] in promoted else row["split"]
+        workspace = root / split / row["task_id"].rsplit("/", 1)[-1]
         if not (workspace / "solution" / "kernel.hip").is_file():
             if workspace.exists():
                 shutil.rmtree(workspace)
-            render_workspace(package, row["task_id"], workspace, task_version=version, split=row["split"])
+            render_workspace(package, row["task_id"], workspace, task_version=version, split=split)
             rendered += 1
-        label = {"task_id": row["task_id"], "split": row["split"], "source": row.get("source"),
+        label = {"task_id": row["task_id"], "split": split, "source": row.get("source"),
                  "task_version": version, "workspace_dir": str(workspace)}
-        by_split[row["split"]].append({"prompt": row["task_id"], "label": label})
+        if row["task_id"] in promoted:
+            label.update(eval128_topup=True, replaces=promoted[row["task_id"]])
+        by_split[split].append({"prompt": row["task_id"], "label": label})
     print(f"rendered {rendered} new workspaces")
     for split, items in sorted(by_split.items()):
         out = root / split / "manifest.jsonl"
@@ -114,14 +209,17 @@ def workspaces(manifest_path: Path, version: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["fetch", "workspaces"])
+    parser.add_argument("command", choices=["fetch", "topup", "workspaces"])
     parser.add_argument("--version", default=VERSION)
     parser.add_argument("--manifest", default=None)
     args = parser.parse_args()
     if args.command == "fetch":
         fetch(args.version)
+        return
+    path = Path(args.manifest) if args.manifest else DATA / "t2h" / "manifests" / f"manifest-{args.version}-latest.json"
+    if args.command == "topup":
+        topup(path, args.version)
     else:
-        path = Path(args.manifest) if args.manifest else DATA / "t2h" / "manifests" / f"manifest-{args.version}-latest.json"
         workspaces(path, args.version)
 
 

@@ -114,6 +114,7 @@ class EpisodeSpec:
     max_output_tokens: int = 16384
     budgets: dict = field(default_factory=dict)
     counters_enabled: bool = True
+    kb: bool = True
     effort: str = ""
 
     @classmethod
@@ -127,6 +128,8 @@ class EpisodeSpec:
         check_path_allowed(spec.workspace_dir)
         if not Path(spec.workspace_dir, "solution", "kernel.hip").is_file():
             raise cc_http.HTTPError(400, "workspace_dir is not a rendered workspace")
+        if not spec.kb and "/kb" in spec.prompt:
+            raise cc_http.HTTPError(400, "a /kb-off episode's prompt must not mention /kb")
         return spec
 
     def public(self) -> dict:
@@ -552,6 +555,8 @@ class Runner:
                                                "episodes": len(self.episodes), "grader": self.client.stats.snapshot()})
         if parts == ["episodes"] and request.method == "POST":
             spec = EpisodeSpec.from_json(request.json())
+            if not spec.kb and not self.args.image_nokb:
+                return cc_http.json_response(400, {"error": "this runner has no /kb-off image (--image-nokb)"})
             if spec.episode in self.episodes:
                 return cc_http.json_response(409, {"error": "episode exists"})
             if self.running() >= self.args.capacity:
@@ -607,16 +612,21 @@ class Runner:
             servers.append(await asyncio.start_unix_server(forwarder, str(sock_dir / "gateway.sock")))
             for sock in ("eval.sock", "gateway.sock"):
                 os.chmod(sock_dir / sock, 0o666)
-            args = container_args(name, self.args.image, CONTAINER_UID, CONTAINER_UID, fwd_dir=str(sock_dir),
+            image = self.args.image if spec.kb else self.args.image_nokb
+            args = container_args(name, image, CONTAINER_UID, CONTAINER_UID, fwd_dir=str(sock_dir),
                                   sock_root=str(self.sock_root), labels=container_labels())
             await self.docker.run("rm", "-f", name)
             rc, out, err = await self.docker.run(*args[1:])
             if rc != 0:
                 raise RuntimeError(f"docker run failed: {err.decode(errors='replace')[:300]}")
             episode.container = name
+            if not spec.kb:
+                rc, _, _ = await self.docker.run("exec", name, "test", "!", "-e", "/kb")
+                if rc != 0:
+                    raise RuntimeError("/kb is present in the /kb-off container")
             workspace = Path(spec.workspace_dir)
-            prompt = spec.prompt or build_prompt(workspace)
-            for target, data in (("/workspace", workspace_tar(workspace)),
+            prompt = spec.prompt or build_prompt(workspace, with_kb=spec.kb)
+            for target, data in (("/workspace", workspace_tar(workspace, with_kb=spec.kb)),
                                  ("/home/agent", home_tar(spec, proxy.token, prompt))):
                 rc, _, err = await self.docker.run("exec", "-i", name, "tar", "-x", "--no-same-owner", "-C", target,
                                                    stdin=data)
@@ -686,16 +696,17 @@ class Runner:
         return files
 
 
-def build_prompt(workspace: Path) -> str:
+def build_prompt(workspace: Path, *, with_kb: bool = True) -> str:
     from cc_prompt import build_prompt as build  # noqa: PLC0415
 
-    return build(workspace)
+    return build(workspace, with_kb=with_kb)
 
 
 async def amain(args) -> None:
     runner = Runner(args)
     server = await asyncio.start_server(cc_http.serve(runner.api), args.host, args.port)
-    logger.info("cc-runner on %s:%s image %s capacity %s", args.host, args.port, args.image, args.capacity)
+    logger.info("cc-runner on %s:%s image %s (no-/kb %s) capacity %s", args.host, args.port, args.image,
+                args.image_nokb, args.capacity)
     async with server:
         await server.serve_forever()
 
@@ -705,6 +716,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18500)
     parser.add_argument("--image", required=True)
+    parser.add_argument("--image-nokb", default=None, help="Pinned image without /kb, for /kb-off episodes.")
     parser.add_argument("--capacity", type=int, default=int(os.environ.get("CC_CONTAINERS_PER_NODE", "32")))
     parser.add_argument("--token-file", default=os.environ.get("CC_RUNNER_TOKEN_FILE"))
     parser.add_argument("--sock-root", default="/tmp/cc-sock")

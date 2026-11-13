@@ -31,6 +31,11 @@ Paths written as `local_knowledge/...` mean `/kb/...`. Some cards link to cards 
 links. The build is fixed (`torch.utils.cpp_extension`, `-O3`, gfx950): compiler flags in a card are
 not available to you.
 
+Host-side snippets in the cards (`hipMalloc`/`hipFree`, blocking `hipMemcpy`/`hipMemset`,
+`hip*Synchronize`, `hipStreamCreate`, HIP graphs, `hipHostMalloc`) are background too: the source
+audit rejects them in `kernel.hip`. Allocate outputs as torch tensors in `run`, launch on the current
+stream, and use only the `*Async` copy and memset forms if you need them.
+
 ## Layout
 
 ```

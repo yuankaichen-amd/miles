@@ -31,7 +31,8 @@ Configuration (environment; files only, never secrets):
     CC_GATEWAY_ADMIN_TOKEN_FILE  0600 admin bearer for the gateways
     HIP_SF_URL_FILE, HIP_SANDBOX_TOKEN_FILE   Crusoe relay URLs and grader token
     CC_CONTEXT, CC_MAX_OUT, CC_STOP_MARGIN, CC_MAX_CALLS, CC_WALL_S, CC_CHECKS_CORRECTNESS,
-    CC_CHECKS_PERF, CC_CHECKS_COUNTERS, CC_CHECKS_COMPILE, CC_COUNTERS (0/1), CC_SERVED_MODEL,
+    CC_CHECKS_PERF, CC_CHECKS_COUNTERS, CC_CHECKS_COMPILE, CC_COUNTERS (0/1), CC_KB (0/1; a label's
+    "counters"/"kb" overrides it per task, for the Phase 0b cells), CC_SERVED_MODEL,
     CC_HEALTHY_FLOOR, CC_EPISODE_LOG
 """
 
@@ -89,6 +90,7 @@ class Config:
     wall_s: int = 1200
     budgets: dict = field(default_factory=dict)
     counters: bool = True
+    kb: bool = True
     healthy_floor: int = 8
     breaker_probe_s: float = 30.0
     grade_concurrency: int = 64
@@ -112,6 +114,7 @@ class Config:
                      "performance": _env_int("CC_CHECKS_PERF", 4),
                      "counters": _env_int("CC_CHECKS_COUNTERS", 1)},
             counters=env.get("CC_COUNTERS", "1") != "0",
+            kb=env.get("CC_KB", "1") != "0",
             healthy_floor=_env_int("CC_HEALTHY_FLOOR", 8),
             grade_concurrency=_env_int("CC_GRADE_CONCURRENCY", 64),
             episode_log=env.get("CC_EPISODE_LOG"),
@@ -333,7 +336,8 @@ class Agent:
             "workspace_dir": label["workspace_dir"], "gateway_token": token, "model": self.config.served_model,
             "split": label.get("split", "train"), "max_turns": self.config.max_calls, "wall_s": self.config.wall_s,
             "max_output_tokens": self.config.max_out, "budgets": self.config.budgets,
-            "counters_enabled": self.config.counters,
+            "counters_enabled": bool(label.get("counters", self.config.counters)),
+            "kb": bool(label.get("kb", self.config.kb)),
         }
 
     async def run(self, base_url: str, label: dict) -> dict:

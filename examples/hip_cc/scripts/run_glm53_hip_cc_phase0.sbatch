@@ -43,6 +43,9 @@ SESSION_PORT=${CC_SESSION_PORT:-30100}
 export HIP_SF_URL_FILE=${HIP_SF_URL_FILE:-${SHARED_ROOT}/hip-cc/crusoe_relay_url.txt}
 export HIP_SANDBOX_TOKEN_FILE=${HIP_SANDBOX_TOKEN_FILE:-${HOME}/.hip_cc/crusoe_grader_token}
 CC_TASKS=${CC_TASKS:?CC_TASKS must name a manifest.jsonl of validated, rendered workspaces}
+if [ "${CC_STEP}" = 0a ] && [ "${CC_KB_OFF_IMAGE:-0}" = 1 ]; then
+  echo "Phase 0a runs on the one pinned image; the /kb-off image is for Phase 0b"; exit 1
+fi
 RUN_DIR=${SHARED_ROOT}/logs/hip-cc-p0-${SLURM_JOB_ID}
 export CC_RUN_DIR=${RUN_DIR}/cc
 OUT=${CC_OUT:-${SHARED_ROOT}/hip-cc/phase0/${CC_STEP}-${SLURM_JOB_ID}}
@@ -65,6 +68,13 @@ config = config.get("text_config", config)
 limit = config.get("max_position_embeddings", 0)
 assert limit >= int(sys.argv[2]), f"max_position_embeddings {limit} < CC_CONTEXT {sys.argv[2]}"
 print(f"context gate: max_position_embeddings {limit}, rope_scaling {config.get('rope_scaling')}, CC_CONTEXT {sys.argv[2]}")
+EOF
+
+python3 - "${CC_TASKS}" <<'EOF'
+import json, sys
+splits = {json.loads(line)["label"]["split"] for line in open(sys.argv[1]) if line.strip()}
+assert splits == {"train"}, f"Phase 0 samples train tasks only; {sys.argv[1]} has {sorted(splits)}"
+print(f"task gate: train only, {sum(1 for line in open(sys.argv[1]) if line.strip())} tasks")
 EOF
 
 echo "== role map (job ${SLURM_JOB_ID}, Phase ${CC_STEP})"

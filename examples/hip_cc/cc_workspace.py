@@ -41,6 +41,8 @@ class IsolationError(RuntimeError):
     pass
 
 
+KB_POINTER = "Reference notes on HIP and MI355X are in `/kb` (read-only).\n\n"
+
 def check_path_allowed(path: str | Path) -> None:
     """Every file rollout-side code opens from the task store goes through this."""
     if FORBIDDEN_PATH.search(str(path)):
@@ -180,12 +182,15 @@ def _readme(task_id: str, task_yaml: str, candidate_doc: str) -> str:
             "aka-eval performance   # MI355X, timing against the PyTorch baseline\n"
             "aka-eval counters      # MI355X hardware counters, after correctness passes\n"
             "aka-eval status        # remaining check budgets\n```\n\n"
-            "Reference notes on HIP and MI355X are in `/kb` (read-only).\n\n"
+            f"{KB_POINTER}"
             f"## Interface\n\n{candidate_doc}")
 
 
-def workspace_tar(workspace: Path) -> bytes:
-    """The workspace as a tar stream for ``docker exec -i <c> tar -x -C /workspace``."""
+def workspace_tar(workspace: Path, *, with_kb: bool = True) -> bytes:
+    """The workspace as a tar stream for ``docker exec -i <c> tar -x -C /workspace``.
+
+    ``with_kb=False`` (the /kb-off ablation arm) drops the README's /kb pointer.
+    """
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         for path in sorted(workspace.rglob("*")):
@@ -193,7 +198,11 @@ def workspace_tar(workspace: Path) -> bytes:
             info = tar.gettarinfo(str(path), arcname=path.relative_to(workspace).as_posix())
             info.uid = info.gid = 0
             info.uname = info.gname = ""
-            if path.is_file():
+            if not with_kb and info.name == "README.md":
+                data = path.read_bytes().replace(KB_POINTER.encode(), b"")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            elif path.is_file():
                 with path.open("rb") as handle:
                     tar.addfile(info, handle)
             else:
