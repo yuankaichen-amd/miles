@@ -9,11 +9,12 @@
 ``rules.runs`` baseline runs present (on as many timing nodes), in the order of the P2 index.
 
 ``topup`` replaces each dropped t2h-eval128 pick with a reserve task of the same source, same
-difficulty first, in the P2 ``eval128_topup_rank`` order. The pick is the first candidate in that
-order that is not dropped; a pending one holds the slot (no skipping ahead to a task that happens to
-have finished validation first). It writes ``$DATA/t2h/eval128-topup-latest.json``; ``workspaces``
-moves the promoted tasks that passed into the t2h-eval128 list, and only once the plan is complete
-(every slot filled by a passed task and no original pick still pending) is t2h-eval128 final.
+difficulty first: the first task in the P2 ``eval128_topup_rank`` order that has passed all runs.
+``$DATA/t2h/eval128-known-drops.txt`` lists tasks Worker B reports as dropped where the manifest
+still says pending (they count as dropped). It writes ``$DATA/t2h/eval128-topup-latest.json``;
+``workspaces`` moves the promoted tasks into the t2h-eval128 list. ``freeze-eval128`` checks the
+list (128 tasks, 64 per source, all passed, plan complete), records its sha256 in
+``$DATA/t2h/eval128-frozen.json`` and makes it read-only; later ``workspaces`` runs leave it alone.
 Each one is rendered once with ``cc_workspace.render_workspace`` (the only path from the task
 store to an agent) into ``$DATA/t2h/workspaces/<split>/<name>/``. Manifest rows are Miles
 prompt-data rows: ``{"prompt": task_id, "label": {task_id, split, source, task_version,
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import shutil
@@ -44,6 +46,15 @@ TOKEN_FILE = os.environ.get("HIP_SANDBOX_TOKEN_FILE") or os.environ.get(
     "HIP_SF_TOKEN_FILE", os.path.expanduser("~/.hip_cc/crusoe_grader_token"))
 VALID_STATUS = ("valid",)
 TOPUP_PLAN = DATA / "t2h" / "eval128-topup-latest.json"
+KNOWN_DROPS = DATA / "t2h" / "eval128-known-drops.txt"
+EVAL128_FROZEN = DATA / "t2h" / "eval128-frozen.json"
+EVAL128_PER_SOURCE = 64
+
+
+def known_drops() -> set[str]:
+    if not KNOWN_DROPS.exists():
+        return set()
+    return {line.split("#", 1)[0].strip() for line in KNOWN_DROPS.read_text().splitlines()} - {""}
 
 
 def passed_all_runs(task: dict | None, runs: int) -> bool:
@@ -80,13 +91,17 @@ def topup(manifest_path: Path, version: str) -> dict:
     rows = [json.loads(line) for line in (DATA / "t2h" / "store" / version / "index.jsonl").read_text().splitlines()
             if line.strip()]
 
+    drops = known_drops()
+
     def state(task_id: str) -> str:
         task = tasks.get(task_id) or {}
+        if task_id in drops:
+            return "dropped"
         if passed_all_runs(task, runs):
             return "passed"
         return "dropped" if task.get("status") == "dropped" else "pending"
 
-    slots, pending_picks, validate_next = [], [], []
+    slots, pending_picks = [], []
     for source in ("cudaagent", "gpumode"):
         picks = [r["task_id"] for r in rows if r["split"] == "t2h-eval128" and r["source"] == source]
         lost = [t for t in picks if state(t) == "dropped"]
@@ -97,7 +112,7 @@ def topup(manifest_path: Path, version: str) -> dict:
         taken: set[str] = set()
         for task_id in lost:
             difficulty = meta.get(task_id, {}).get("difficulty")
-            open_pool = [t for t in pool if t not in taken and state(t) != "dropped"]
+            open_pool = [t for t in pool if t not in taken and state(t) == "passed"]
             same = [t for t in open_pool if meta[t]["difficulty"] == difficulty]
             pick = (same or open_pool or [None])[0]
             if pick:
@@ -105,12 +120,9 @@ def topup(manifest_path: Path, version: str) -> dict:
             slots.append({"replaces": task_id, "source": source, "difficulty": difficulty, "task_id": pick,
                           "rank": meta[pick]["rank"] if pick else None,
                           "same_difficulty": bool(same), "state": state(pick) if pick else "no_candidate"})
-        # What validation should finish first: each unfilled pick plus two backups in rank order.
-        unfilled = [s for s in slots if s["source"] == source and s["state"] != "passed"]
-        spare = [t for t in pool if t not in taken and state(t) == "pending"]
-        validate_next += [s["task_id"] for s in unfilled if s["task_id"]] + spare[: 2 * len(unfilled)]
     plan = {"version": version, "manifest": manifest_path.name, "generated_at": manifest.get("generated_at"),
-            "runs": runs, "slots": slots, "eval128_pending": len(pending_picks), "validate_next": validate_next,
+            "runs": runs, "slots": slots, "eval128_pending": len(pending_picks),
+            "known_drops": sorted(drops),
             "complete": not pending_picks and all(s["state"] == "passed" for s in slots)}
     tmp = TOPUP_PLAN.with_suffix(".tmp")
     tmp.write_text(json.dumps(plan, indent=1) + "\n")
@@ -160,7 +172,7 @@ def fetch(version: str) -> Path:
     return out
 
 
-def workspaces(manifest_path: Path, version: str) -> None:
+def workspaces(manifest_path: Path, version: str, splits: set[str] | None = None) -> None:
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("version") != version:
         raise SystemExit(f"manifest version {manifest.get('version')} != {version}")
@@ -172,6 +184,7 @@ def workspaces(manifest_path: Path, version: str) -> None:
         print(f"top-up plan is for the manifest of {plan.get('generated_at')}; rerun topup on this one first")
         plan = {}
     promoted = {s["task_id"]: s["replaces"] for s in plan.get("slots", []) if s.get("state") == "passed"}
+    drops = known_drops()
     index = DATA / "t2h" / "store" / version / "index.jsonl"
     rows = [json.loads(line) for line in index.read_text().splitlines() if line.strip()]
     from cc_workspace import render_workspace  # noqa: PLC0415
@@ -181,9 +194,11 @@ def workspaces(manifest_path: Path, version: str) -> None:
     by_split: dict[str, list[dict]] = collections.defaultdict(list)
     rendered = 0
     for row in rows:
-        if not passed_all_runs(tasks.get(row["task_id"]), runs):
+        if row["task_id"] in drops or not passed_all_runs(tasks.get(row["task_id"]), runs):
             continue
         split = "t2h-eval128" if row["task_id"] in promoted else row["split"]
+        if splits and split not in splits:
+            continue
         workspace = root / split / row["task_id"].rsplit("/", 1)[-1]
         if not (workspace / "solution" / "kernel.hip").is_file():
             if workspace.exists():
@@ -197,6 +212,9 @@ def workspaces(manifest_path: Path, version: str) -> None:
         by_split[split].append({"prompt": row["task_id"], "label": label})
     print(f"rendered {rendered} new workspaces")
     for split, items in sorted(by_split.items()):
+        if split == "t2h-eval128" and EVAL128_FROZEN.exists():
+            print(f"t2h-eval128 is frozen ({EVAL128_FROZEN}); not rewritten")
+            continue
         out = root / split / "manifest.jsonl"
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(".jsonl.tmp")
@@ -207,9 +225,45 @@ def workspaces(manifest_path: Path, version: str) -> None:
         print("no validated tasks yet; statuses seen:", collections.Counter(status.values()).most_common(8))
 
 
+def freeze_eval128(manifest_path: Path, version: str) -> dict:
+    manifest = json.loads(manifest_path.read_text())
+    runs = int((manifest.get("rules") or {}).get("runs", 3))
+    tasks = {t["task_id"]: t for t in manifest["tasks"]}
+    plan = json.loads(TOPUP_PLAN.read_text())
+    out = DATA / "t2h" / "workspaces" / "t2h-eval128" / "manifest.jsonl"
+    raw = out.read_bytes()
+    rows = [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+    ids = [r["label"]["task_id"] for r in rows]
+    per_source = collections.Counter(r["label"]["source"] for r in rows)
+    drops = known_drops()
+    problems = []
+    if plan.get("generated_at") != manifest.get("generated_at") or not plan.get("complete"):
+        problems.append("top-up plan is not complete for this manifest")
+    if len(ids) != 2 * EVAL128_PER_SOURCE or len(set(ids)) != len(ids):
+        problems.append(f"{len(ids)} rows ({len(set(ids))} distinct), want {2 * EVAL128_PER_SOURCE}")
+    if any(n != EVAL128_PER_SOURCE for n in per_source.values()) or len(per_source) != 2:
+        problems.append(f"per source {dict(per_source)}")
+    bad = [t for t in ids if t in drops or not passed_all_runs(tasks.get(t), runs)]
+    if bad:
+        problems.append(f"{len(bad)} rows not passed: {bad[:5]}")
+    if problems:
+        raise SystemExit("eval128 not frozen: " + "; ".join(problems))
+    record = {"sha256": hashlib.sha256(raw).hexdigest(), "path": str(out), "tasks": len(ids),
+              "per_source": dict(per_source), "topped_up": sum(1 for r in rows if r["label"].get("eval128_topup")),
+              "task_version": version, "manifest_generated_at": manifest.get("generated_at"),
+              "known_drops": sorted(drops), "task_ids": sorted(ids)}
+    EVAL128_FROZEN.write_text(json.dumps(record, indent=1) + "\n")
+    os.chmod(out, 0o444)
+    os.chmod(EVAL128_FROZEN, 0o444)
+    print(f"t2h-eval128 frozen: sha256 {record['sha256']}, {len(ids)} tasks {dict(per_source)}, "
+          f"{record['topped_up']} from reserve -> {EVAL128_FROZEN}")
+    return record
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["fetch", "topup", "workspaces"])
+    parser.add_argument("command", choices=["fetch", "topup", "workspaces", "freeze-eval128"])
+    parser.add_argument("--splits", default="", help="workspaces: only these splits (comma list)")
     parser.add_argument("--version", default=VERSION)
     parser.add_argument("--manifest", default=None)
     args = parser.parse_args()
@@ -219,8 +273,10 @@ def main() -> None:
     path = Path(args.manifest) if args.manifest else DATA / "t2h" / "manifests" / f"manifest-{args.version}-latest.json"
     if args.command == "topup":
         topup(path, args.version)
+    elif args.command == "freeze-eval128":
+        freeze_eval128(path, args.version)
     else:
-        workspaces(path, args.version)
+        workspaces(path, args.version, {s for s in args.splits.split(",") if s} or None)
 
 
 if __name__ == "__main__":
