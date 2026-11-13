@@ -517,6 +517,36 @@ def _response_summary(content: bytes, content_type: str) -> dict:
     return summary
 
 
+class DenialLog:
+    """ASGI wrapper: every request answered 401/403/404/405 goes to ``<log_dir>/denials.jsonl``.
+
+    Records method, path, status and client address only, never headers or bodies (tokens).
+    """
+
+    DENIED = (401, 403, 404, 405)
+
+    def __init__(self, app, path: Path):
+        self.app = app
+        self.handle = path.open("a", buffering=1)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        status = {}
+
+        async def capture(message):
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            await send(message)
+
+        await self.app(scope, receive, capture)
+        if status.get("code") in self.DENIED:
+            client = scope.get("client") or ("", 0)
+            self.handle.write(json.dumps({"t": round(time.time(), 3), "event": "gateway_denied",
+                                          "method": scope.get("method"), "path": scope.get("path", "")[:200],
+                                          "status": status["code"], "client": client[0]}) + "\n")
+
+
 def build_app(args) -> Starlette:
     gateway = Gateway(args)
     app = Starlette(routes=[
@@ -528,6 +558,7 @@ def build_app(args) -> Starlette:
         Route("/e/{episode}/v1/messages", gateway.messages, methods=["POST"]),
     ])
     app.state.gateway = gateway
+    app.add_middleware(DenialLog, path=Path(args.log_dir) / "denials.jsonl")
     return app
 
 

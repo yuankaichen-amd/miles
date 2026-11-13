@@ -11,9 +11,10 @@ a task into a workspace, and it reads the tarball through an allowlist:
 * the rendered workspace is AKA's ``render_workspace`` output reduced to ``config.yaml``,
   ``README.md``, ``reference/reference.py``, ``solution/kernel.hip`` and an ``_aka_eval/``
   holding the shim and a contract summary without seeds;
-* containers get the workspace through a tar stream into a tmpfs ``/workspace``; there are no
-  host mounts, and ``check_docker_args`` refuses any bind of ``/shared_inference``, ``/home``
-  or a path naming ``hip_ref``/``feasibility``.
+* containers get the workspace through a tar stream into a tmpfs ``/workspace``; the only host
+  mount is the episode's read-only socket directory at ``/fwd``, and ``check_docker_args``
+  refuses any other bind, ``/shared_inference``, ``/home`` or a path naming
+  ``hip_ref``/``feasibility``.
 """
 
 from __future__ import annotations
@@ -46,8 +47,12 @@ def check_path_allowed(path: str | Path) -> None:
         raise IsolationError(f"refusing to read {path}: hip_ref material is not for rollouts")
 
 
-def check_docker_args(args: list[str]) -> None:
-    """Containers may not bind host paths; tmpfs and named volumes only."""
+def check_docker_args(args: list[str], sock_root: str | None = None) -> None:
+    """Containers may not bind host paths; tmpfs and named volumes only.
+
+    The one exception is the episode's socket directory: a direct child of ``sock_root`` bound
+    read-only at ``/fwd`` (it holds only the gateway and eval-proxy unix sockets).
+    """
     flat = " ".join(args)
     for index, arg in enumerate(args):
         value = None
@@ -59,12 +64,24 @@ def check_docker_args(args: list[str]) -> None:
             continue
         source = value.split(":", 1)[0] if arg in ("-v", "--volume") or arg.startswith(("--volume=", "-v=")) else \
             next((p.split("=", 1)[1] for p in value.split(",") if p.startswith(("source=", "src="))), "")
+        if sock_root and _is_socket_bind(value, sock_root):
+            continue
         if source.startswith("/") or FORBIDDEN_PATH.search(source):
             raise IsolationError(f"host mount {source!r} is not allowed in rollout containers")
     if "--privileged" in args or "--volumes-from" in flat:
         raise IsolationError("privileged containers and --volumes-from are not allowed")
     if FORBIDDEN_PATH.search(flat) or any(root in flat for root in ("/shared_inference", "/shared_nfs")):
         raise IsolationError("docker arguments name a forbidden host path")
+
+
+def _is_socket_bind(value: str, sock_root: str) -> bool:
+    parts = value.split(":")
+    if len(parts) != 3 or parts[1] != "/fwd" or parts[2] != "ro":
+        return False
+    source, root = Path(parts[0]), Path(sock_root)
+    return source.is_absolute() and source.parent == root and ".." not in source.parts and \
+        not FORBIDDEN_PATH.search(parts[0]) and not any(r in parts[0] for r in ("/shared_inference", "/shared_nfs",
+                                                                                 "/home"))
 
 
 def _task_member_prefix(names: list[str], task_id: str) -> str:
@@ -98,37 +115,17 @@ def _aka():
     return aka_validator()
 
 
-SHIM = '''"""Workspace check commands: python3 -m _aka_eval.evaluate candidate compile|correctness|performance.
+SHIM = '''"""python3 -m _aka_eval.evaluate candidate compile|correctness|performance|counters
 
-compile runs hipcc here (gfx950, no GPU needed); correctness and performance send
-solution/kernel.hip to the node's eval-proxy, which grades on MI355X and returns a summary.
+The same as `aka-eval <action>`: compile builds solution/kernel.hip here for gfx950; the other
+actions go to MI355X through the node's eval-proxy.
 """
-import json, os, subprocess, sys, urllib.request
-from pathlib import Path
+import os
+import sys
 
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def main():
-    if len(sys.argv) != 3 or sys.argv[1] != "candidate" or sys.argv[2] not in ("compile", "correctness", "performance"):
-        sys.exit("usage: python3 -m _aka_eval.evaluate candidate compile|correctness|performance")
-    action, source = sys.argv[2], ROOT / "solution" / "kernel.hip"
-    if action == "compile":
-        cmd = os.environ.get("AKA_COMPILE_CMD", "hipcc --offload-arch=gfx950 -O3 -fsyntax-only").split()
-        sys.exit(subprocess.run(cmd + [str(source)]).returncode)
-    url = os.environ.get("CC_EVAL_PROXY_URL")
-    token_file = os.environ.get("CC_EVAL_TOKEN_FILE", str(Path.home() / ".cc_eval_token"))
-    if not url:
-        sys.exit("eval-proxy is not configured in this container")
-    body = json.dumps({"action": action, "source": source.read_text()}).encode()
-    request = urllib.request.Request(f"{url.rstrip('/')}/check", data=body, headers={
-        "content-type": "application/json", "authorization": "Bearer " + Path(token_file).read_text().strip()})
-    with urllib.request.urlopen(request, timeout=900) as response:
-        print(response.read().decode())
-
-
-if __name__ == "__main__":
-    main()
+if len(sys.argv) != 3 or sys.argv[1] != "candidate":
+    sys.exit("usage: python3 -m _aka_eval.evaluate candidate compile|correctness|performance|counters")
+os.execv("/opt/cc/bin/aka-eval", ["aka-eval", sys.argv[2]])
 '''
 
 
@@ -178,9 +175,11 @@ def _readme(task_id: str, task_yaml: str, candidate_doc: str) -> str:
             f"## Task\n\n{raw.get('description', '').strip()}\n\n"
             "## Rules\n\nNo PyTorch, rocBLAS or hipBLAS calls in the kernel, no memoizing outputs, no special-casing "
             "inputs.\n\n"
-            "## Checks\n\n```\npython3 -m _aka_eval.evaluate candidate compile\n"
-            "python3 -m _aka_eval.evaluate candidate correctness\n"
-            "python3 -m _aka_eval.evaluate candidate performance\n```\n\n"
+            "## Checks\n\n```\naka-eval compile       # local gfx950 build, audit and register/LDS report\n"
+            "aka-eval correctness   # MI355X, against the PyTorch reference\n"
+            "aka-eval performance   # MI355X, timing against the PyTorch baseline\n"
+            "aka-eval counters      # MI355X hardware counters, after correctness passes\n"
+            "aka-eval status        # remaining check budgets\n```\n\n"
             "Reference notes on HIP and MI355X are in `/kb` (read-only).\n\n"
             f"## Interface\n\n{candidate_doc}")
 
@@ -202,7 +201,9 @@ def workspace_tar(workspace: Path) -> bytes:
     return buffer.getvalue()
 
 
-def container_args(name: str, image: str, uid: int, gid: int, network: str = "none") -> list[str]:
+def container_args(name: str, image: str, uid: int, gid: int, network: str = "none", *,
+                   fwd_dir: str | None = None, sock_root: str | None = None,
+                   labels: dict[str, str] | None = None) -> list[str]:
     """``docker run`` arguments for a rollout container (plan §4.2), checked by ``check_docker_args``."""
     args = ["docker", "run", "-d", "--name", name, "--user", f"{uid}:{gid}", "--network", network,
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512",
@@ -210,6 +211,11 @@ def container_args(name: str, image: str, uid: int, gid: int, network: str = "no
             "--tmpfs", f"/workspace:rw,exec,size=512m,uid={uid},gid={gid}",
             "--tmpfs", f"/tmp:rw,exec,size=2g,uid={uid},gid={gid}",
             "--tmpfs", f"/home/agent:rw,size=256m,uid={uid},gid={gid}",
-            "-e", "HOME=/home/agent", "-w", "/workspace", image, "sleep", "infinity"]
-    check_docker_args(args)
+            "-e", "HOME=/home/agent", "-w", "/workspace"]
+    for key, value in (labels or {}).items():
+        args += ["--label", f"{key}={value}"]
+    if fwd_dir:
+        args += ["-v", f"{fwd_dir}:/fwd:ro"]
+    args += [image, "sleep", "infinity"]
+    check_docker_args(args, sock_root)
     return args

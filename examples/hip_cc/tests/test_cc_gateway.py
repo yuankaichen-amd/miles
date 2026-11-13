@@ -362,3 +362,29 @@ def test_logs_are_deltas_after_first_call(tmp_path):
         assert reqs[1]["request"]["messages_total"] == 3
 
     run(go())
+
+
+def test_requests_off_the_allowlist_are_logged(tmp_path):
+    h = Harness(tmp_path)
+
+    async def main():
+        episode, token = await h.register()
+        statuses = [
+            (await h.client.get("/sessions/s1/samples")).status_code,
+            (await h.client.post("/flush_cache")).status_code,
+            (await h.client.post("/episodes", json={}, headers={"authorization": "Bearer wrong"})).status_code,
+            (await h.client.get(f"/episodes/{episode}")).status_code,
+            (await h.client.post(f"/e/{episode}/v1/messages", json={}, headers={"x-api-key": "wrong"})).status_code,
+            (await h.client.get(f"/e/{episode}/v1/messages", headers={"x-api-key": token})).status_code,
+        ]
+        await h.finish(episode)
+        return statuses, token
+
+    statuses, token = run(main())
+    assert statuses == [404, 404, 401, 401, 401, 405], statuses
+    text = (h.log_dir / "denials.jsonl").read_text()
+    records = [json.loads(line) for line in text.splitlines()]
+    assert [(r["method"], r["path"], r["status"]) for r in records] == [
+        ("GET", "/sessions/s1/samples", 404), ("POST", "/flush_cache", 404), ("POST", "/episodes", 401),
+        ("GET", "/episodes/ep1", 401), ("POST", "/e/ep1/v1/messages", 401), ("GET", "/e/ep1/v1/messages", 405)]
+    assert token not in text and ADMIN not in text and "wrong" not in text

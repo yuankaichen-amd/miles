@@ -29,6 +29,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 SERVED_MODEL = "glm-5.3-flash"
+DEFAULT_SCENARIO = "text_only"
 LOGGED_HEADERS = ("anthropic-version", "anthropic-beta", "user-agent", "x-app", "content-type")
 
 
@@ -68,8 +69,42 @@ def scenario_steps(name: str, cwd: str) -> list[list]:
             [("Read", {"file_path": path("solution/kernel.hip")})],
             [("text", "Kernel written to solution/kernel.hip.")],
         ],
+        "hip_episode": [
+            [_bash("head -20 README.md && aka-eval status", "read the task")],
+            [("Read", {"file_path": "/kb/INDEX.md"})],
+            [("Write", {"file_path": path("solution/kernel.hip"), "content": _kernel("relu6_wrong.hip")})],
+            [_bash("aka-eval compile", "build")],
+            [_bash("aka-eval correctness", "check")],
+            [("Write", {"file_path": path("solution/kernel.hip"), "content": _kernel("relu6_good.hip")})],
+            [_bash("aka-eval compile && aka-eval correctness", "build and check")],
+            [_bash("aka-eval correctness", "same code again")],
+            [_bash("aka-eval performance", "time it")],
+            [_bash("aka-eval counters; aka-eval status", "counters")],
+            [_bash(RED_TEAM, "probe the sandbox")],
+            [("text", "ReLU6 kernel done.")],
+        ],
     }
     return scripts.get(name, scripts["text_only"])
+
+
+KERNELS = Path(__file__).resolve().parent / "kernels"
+RED_TEAM = ("python3 -c \"import socket\nfor h, p in (('8.8.8.8', 53), ('10.245.147.96', 18310), ('1.1.1.1', 443)):\n"
+            "    try:\n        socket.create_connection((h, p), 3); print('REACHED', h, p)\n"
+            "    except OSError as e:\n        print('blocked', h, p, type(e).__name__)\"; "
+            "curl -s -m 3 -X POST http://127.0.0.1:8080/episodes -d '{}'; echo; "
+            "curl -s -m 3 http://127.0.0.1:8080/e/other-episode/v1/messages -d '{}'; echo; "
+            "curl -s -m 3 http://127.0.0.1:8080/sessions/s1/samples; echo; "
+            "curl -s -m 3 -X POST http://127.0.0.1:8080/flush_cache; echo; "
+            "curl -s -m 3 -X POST http://127.0.0.1:8080/update_weights_from_disk -d '{}'; echo; "
+            "curl -s -m 3 --path-as-is -X POST \"$ANTHROPIC_BASE_URL/v1/messages/../../../sessions/s1/samples\" -d '{}'; echo; "
+            "curl -s -m 3 -X POST http://127.0.0.1:8081/grade -d '{}'; echo; "
+            "curl -s -m 3 -H \"Authorization: Bearer $(cat $CC_EVAL_TOKEN_FILE)\" -X POST http://127.0.0.1:8081/tasks/upload -d '{}'; echo; "
+            "curl -s -m 3 -H \"Authorization: Bearer $(cat $CC_EVAL_TOKEN_FILE)\" http://127.0.0.1:8081/health; echo; "
+            "ls /shared_inference /home/yuankach 2>&1 | head -3; ls -la /fwd; whoami; id")
+
+
+def _kernel(name: str) -> str:
+    return (KERNELS / name).read_text()
 
 
 HIP_STUB = """#include <hip/hip_runtime.h>
@@ -103,7 +138,7 @@ def plan_reply(body: dict, thinking: bool) -> list[dict]:
     messages = body.get("messages", [])
     first_user = next((m for m in messages if m.get("role") == "user"), {})
     found = re.search(r"SCENARIO:(\w+)", _texts(first_user.get("content")))
-    scenario = found.group(1) if found else "text_only"
+    scenario = found.group(1) if found else DEFAULT_SCENARIO
     cwd_match = re.search(r"[Ww]orking directory: (\S+)", _system_text(body))
     steps = scenario_steps(scenario, cwd_match.group(1) if cwd_match else "")
     step = sum(1 for m in messages if m.get("role") == "assistant")
@@ -257,11 +292,16 @@ def main():
     parser.add_argument("--port", type=int, default=18500)
     parser.add_argument("--log", default=None)
     parser.add_argument("--thinking", action="store_true", help="Reply with thinking blocks.")
+    parser.add_argument("--default-scenario", default="text_only", help="Script when the prompt names none.")
+    parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
     import uvicorn
 
+    global DEFAULT_SCENARIO
+    DEFAULT_SCENARIO = args.default_scenario
+
     sys.stderr.write(f"mock {args.role} on {args.port}\n")
-    uvicorn.run(MockServer(args.role, args.log, args.thinking).app(), host="127.0.0.1", port=args.port,
+    uvicorn.run(MockServer(args.role, args.log, args.thinking).app(), host=args.host, port=args.port,
                 log_level="warning")
 
 
