@@ -17,6 +17,9 @@
 #   sbatch -N 1 --export=ALL,CC_STEP=0a,MODEL=...,CC_TASKS=...,CC_TASK_LIMIT=5,CC_SAMPLES=4,... \
 #     run_glm53_hip_cc_phase0.sbatch
 #   DRY_RUN=1: print the role map (nodes, ports, containers, files) and exit without starting anything.
+#   CC_HOLD=1: start the stack, write $RUN_DIR/job.env and wait for $RUN_DIR/STOP instead of running the
+#     driver; Phase 0a checks and episode batches run through srun --overlap (phase0a/driver.sh).
+#   CC_LOG_REQUESTS=1: SGLang logs every request in full (json, $RUN_DIR/sglang-requests/) for check 3.
 #
 # --export carries file paths only. The runner and gateway tokens are minted here into a 0700
 # directory under ~/.hip_cc and shredded at exit; the grader token stays in HIP_SANDBOX_TOKEN_FILE.
@@ -108,6 +111,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'echo "caught signal"; exit 1' USR1 TERM
 
+# The Crusoe relay must answer from the compute node before any container starts.
+python3 "${HC}/phase0a/relay_health.py" || { echo "relay health failed; no containers started"; exit 1; }
+
 # Every node must reproduce the published image ID before any container starts on any node.
 srun --nodes="${NODES}" --ntasks="${NODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 -w "${ROLL_LIST}" \
   bash "${SNAP}/cc_node.sh" verify || { echo "image verification failed; no containers started"; exit 1; }
@@ -121,9 +127,12 @@ srun --nodes="${NODES}" --ntasks="${NODES}" --ntasks-per-node=1 --kill-on-bad-ex
 
 SGLANG_ENV="export SGLANG_USE_AITER=1 HSA_NO_SCRATCH_RECLAIM=1 PYTHONPATH=${SGLANG_DIR:-/home/yuankach/Miles-Primus/sglang-yk/python}:${MILES_DIR}"
 SGLANG_EXTRA=()
+if [ "${CC_LOG_REQUESTS:-0}" = 1 ]; then
+  SGLANG_EXTRA+=(--log-requests --log-requests-level 3 --log-requests-format json --log-requests-target "${RUN_DIR}/sglang-requests")
+fi
 if [ "${SGLANG_PROFILE:-rocm}" = rocm ]; then
   SGLANG_ENV+=" AITER_ONLINE_TUNE=0 HIP_FORCE_DEV_KERNARG=1 AITER_CONFIG_FMOE=${AITER_CONFIG_FMOE:-${SHARED_ROOT}/aiter_configs/tuned_fmoe_mi300.csv}"
-  SGLANG_EXTRA=(--dsa-prefill-backend tilelang --dsa-decode-backend tilelang --moe-runner-backend aiter --cuda-graph-max-bs-decode 128)
+  SGLANG_EXTRA+=(--dsa-prefill-backend tilelang --dsa-decode-backend tilelang --moe-runner-backend aiter --cuda-graph-max-bs-decode 128)
 fi
 SESSION_CONFIG=$(python3 - "${MODEL}" "${SESSION_PORT}" "${SGLANG_PORT}" <<'EOF'
 import json, sys
@@ -163,6 +172,31 @@ for _ in $(seq 1 360); do
 done
 [ "${ready}" = "${NODES}" ] && [ "${nodes_up}" = "${NODES}" ] || { echo "not ready: sglang+session ${ready}/${NODES}, cc nodes ${nodes_up}/${NODES}"; exit 1; }
 echo "ready: ${SESSION_URLS}; cc nodes:"; cat "${CC_RUN_DIR}/cc_nodes.txt"
+
+if [ "${CC_HOLD:-0}" = 1 ]; then
+  cat > "${RUN_DIR}/job.env" <<EOF
+JOB=${SLURM_JOB_ID}
+NODE=${ROLL_NODES[0]}
+RUN_DIR=${RUN_DIR}
+CC_RUN_DIR=${CC_RUN_DIR}
+CC_SECRETS_DIR=${CC_SECRETS_DIR}
+SESSION_URLS=${SESSION_URLS}
+SGLANG_URL=http://${HEAD_IP}:${SGLANG_PORT}
+IMAGE=${IMAGE}
+HC=${HC}
+OUT=${OUT}
+MODEL=${MODEL}
+CC_CONTEXT=${CC_CONTEXT}
+HIP_SF_URL_FILE=${HIP_SF_URL_FILE}
+HIP_SANDBOX_TOKEN_FILE=${HIP_SANDBOX_TOKEN_FILE}
+EOF
+  echo "HOLD: stack up; waiting for ${RUN_DIR}/STOP"
+  while [ ! -e "${RUN_DIR}/STOP" ]; do
+    kill -0 "${CC_PID}" 2>/dev/null || { echo "cc_node step died"; tail -40 "${CC_RUN_DIR}/cc_node.log"; exit 1; }
+    sleep 20
+  done
+  echo "PHASE 0 ${CC_STEP} HOLD ENDED $(date -u)"; exit 0
+fi
 
 docker run --rm --name "cc_drv_${SLURM_JOB_ID}" --network host --user "$(id -u):$(id -g)" \
   -e HOME=/tmp -e PYTHONPATH="${HC}" \
