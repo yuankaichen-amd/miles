@@ -914,7 +914,32 @@ class TestComputeSessionMismatch:
         registry.comparator = mock_comparator
 
         result = registry.compute_session_mismatch(session)
-        assert result == [{"position": 2, "detail": "mismatch"}]
+        assert result == [{"position": 2, "detail": "mismatch", "leaf_node_id": 0}]
+
+    def test_checks_every_leaf_not_only_the_latest(self, registry: SessionRegistryV2):
+        sid = registry.create_session()
+        session = registry.get_session(sid)
+        _commit(session, [SYS_MSG, USER_MSG], ASSISTANT_MSG_1, [1, 2, 3], [10, 11], max_trim_tokens=0)
+        _commit(session, [SYS_MSG, USER_MSG], ASSISTANT_MSG_2, [1, 2, 3], [20, 21], max_trim_tokens=0)
+        assert [leaf.seq for leaf in session.tree.leaves()] == [0, 1]
+
+        registry.tito_tokenizer.apply_chat_template = MagicMock(return_value=[1, 2, 3, 10, 11])
+
+        @dataclass
+        class FakeMismatch:
+            position: int
+
+            def to_dict(self):
+                return {"position": self.position}
+
+        mock_comparator = MagicMock()
+        mock_comparator.compare_sequences.side_effect = lambda expected, actual: (
+            [] if expected == actual else [FakeMismatch(position=3)]
+        )
+        registry.comparator = mock_comparator
+
+        assert registry.compute_session_mismatch(session) == [{"position": 3, "leaf_node_id": 1}]
+        assert mock_comparator.compare_sequences.call_count == 2
 
     def test_raises_tokenization_error_on_exception(self, registry: SessionRegistryV2):
         sid = registry.create_session()

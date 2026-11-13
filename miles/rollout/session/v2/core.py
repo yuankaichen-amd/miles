@@ -217,6 +217,7 @@ class SessionCoreV2(SessionCore):
                 response_id=response.get("id", ""),
                 finish_reason=choice.get("finish_reason") or "",
                 turn_args=request_body,
+                tito_tokenizer=tito_tokenizer,
             )
         # --- lock released ---
 

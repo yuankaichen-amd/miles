@@ -272,6 +272,12 @@ class TITOTokenizer:
         """
         return assistant_message
 
+    def close_truncated_reasoning(self, token_ids: list[int]) -> list[int]:
+        """Token IDs the template renders after a length-truncated generation
+        that the model never sampled. The session server appends them, outside
+        the completion span, so stored tokens stay the canonical render."""
+        return []
+
     def preserve_server_message_state(
         self,
         stored_messages: list[dict[str, Any]],
@@ -547,6 +553,31 @@ class GLM53TITOTokenizer(GLM47TITOTokenizer):
         extra_kwargs={"clear_thinking": False, "enable_thinking": True},
         consistant_kwargs=["reasoning_effort"],
     )
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        super().__init__(tokenizer, chat_template_kwargs, assistant_start_str)
+        self._assistant_id: int = tokenizer.convert_tokens_to_ids("<|assistant|>")
+        self._think_open_id: int = tokenizer.convert_tokens_to_ids("<think>")
+        self._think_close_id: int = tokenizer.convert_tokens_to_ids("</think>")
+
+    def close_truncated_reasoning(self, token_ids: list[int]) -> list[int]:
+        """``</think>`` when the last assistant turn's reasoning is still open.
+
+        The template renders every history turn as ``<think>…</think>`` (the
+        generation prompt already ends in ``<think>``), so a generation cut at
+        max_tokens inside its reasoning differs from the render by that token.
+        """
+        for token_id in reversed(token_ids):
+            if token_id == self._think_open_id:
+                return [self._think_close_id]
+            if token_id in (self._think_close_id, self._assistant_id):
+                return []
+        return []
 
 
 # ---------------------------------------------------------------------------

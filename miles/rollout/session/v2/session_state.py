@@ -178,10 +178,15 @@ def commit_generation(
     response_id: str,
     finish_reason: str,
     turn_args: dict[str, Any] | None = None,
+    tito_tokenizer: TITOTokenizer | None = None,
 ) -> TrajectoryNode:
     """Validate and append one generation under *parent* (the request's attach
     node). Prefix validation is byte-identical to the pre-tree checkpoint check.
-    ``turn_args`` is the full resolved request for this generation."""
+    ``turn_args`` is the full resolved request for this generation.
+
+    A ``length`` stop gets the template's closing tokens appended (``closing_span``),
+    so the stored tokens stay the canonical render of the path; truncated nodes
+    are never extended, so the span is always the leaf's tail."""
     all_token_ids = prompt_token_ids + completion_token_ids
     assert_pretokenized_prefix(
         parent.token_ids if parent is not None else [],
@@ -191,18 +196,23 @@ def commit_generation(
         assistant_message=assistant_message,
     )
 
+    closing: list[int] = []
+    if finish_reason == "length" and tito_tokenizer is not None:
+        closing = tito_tokenizer.close_truncated_reasoning(all_token_ids)
+
     parent_messages = parent.path_messages() if parent is not None else []
     delta = list(request_messages[len(parent_messages) :]) + [assistant_message]
     node = state.tree.create_node(
         parent,
         delta_messages=delta,
-        token_ids=all_token_ids,
+        token_ids=all_token_ids + closing,
         completion_span=(len(prompt_token_ids), len(all_token_ids)),
         committed_at=record.timestamp,
         response_id=response_id,
         record=record,
         finish_reason=finish_reason,
         turn_args=turn_args,
+        closing_span=(len(all_token_ids), len(all_token_ids) + len(closing)) if closing else None,
     )
     return node
 
@@ -259,8 +269,12 @@ class SessionRegistryV2(SessionRegistry):
             raise TokenizationError(f"failed to compute tito_session_mismatch: {e}") from e
 
     def compute_session_mismatch(self, state: SessionStateV2) -> list[dict] | None:
-        """``compute_mismatch`` over the latest committed generation's path."""
-        node = state.latest()
-        if node is None:
+        """``compute_mismatch`` over every leaf's path, each entry tagged with its
+        ``leaf_node_id``; ``None`` before the first commit."""
+        if not state.tree.nodes:
             return None
-        return self.compute_mismatch(node.path_messages(), node.token_ids, turn_args=node.turn_args)
+        mismatches: list[dict] = []
+        for leaf in state.tree.leaves():
+            found = self.compute_mismatch(leaf.path_messages(), leaf.token_ids, turn_args=leaf.turn_args)
+            mismatches.extend({**m, "leaf_node_id": leaf.seq} for m in found or [])
+        return mismatches

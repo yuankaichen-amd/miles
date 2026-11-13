@@ -30,6 +30,7 @@ def tree_metadata(state: SessionStateV2) -> dict:
             "truncated": node.truncated,
             "committed_at": node.committed_at,
             "completion_span": list(node.completion_span),
+            "closing_span": list(node.closing_span) if node.closing_span is not None else None,
             "num_tokens": len(node.token_ids),
             "response_id": node.response_id,
             "turn_args": filter_turn_args(node.turn_args),
@@ -70,7 +71,8 @@ def build_leaf_material(
             args,
             records,
             registry.tokenizer,
-            accumulated_token_ids=leaf.token_ids,
+            # The closing span was never sampled, so samples align against the generated tokens.
+            accumulated_token_ids=leaf.generated_token_ids,
             max_trim_tokens=registry.tito_tokenizer.max_trim_tokens,
             use_addition_r3=use_addition_r3,
         )

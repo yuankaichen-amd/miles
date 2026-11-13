@@ -29,12 +29,19 @@ class TrajectoryNode:
     finish_reason: str
     # Full resolved request for this generation, isolated from mutable request data.
     turn_args: dict[str, Any] = field(default_factory=dict)
+    # Template tokens appended after a truncated completion (never sampled, never trained).
+    closing_span: tuple[int, int] | None = None
     parent: "TrajectoryNode | None" = None
     children: list["TrajectoryNode"] = field(default_factory=list, repr=False)
 
     @property
     def truncated(self) -> bool:
         return self.finish_reason == "length"
+
+    @property
+    def generated_token_ids(self) -> list[int]:
+        """``token_ids`` without the closing span: what the engine actually saw and sampled."""
+        return self.token_ids[: self.closing_span[0]] if self.closing_span is not None else self.token_ids
 
     def path_nodes(self) -> list["TrajectoryNode"]:
         nodes: list[TrajectoryNode] = []
@@ -80,6 +87,7 @@ class SessionTree:
         record: SessionRecord,
         finish_reason: str,
         turn_args: dict[str, Any] | None = None,
+        closing_span: tuple[int, int] | None = None,
     ) -> TrajectoryNode:
         if len(self.nodes) >= MAX_NODES:
             raise ValueError(
@@ -97,6 +105,7 @@ class SessionTree:
             record=record,
             finish_reason=finish_reason,
             turn_args=deepcopy(turn_args or {}),
+            closing_span=closing_span,
             parent=parent,
         )
         self.nodes.append(node)
