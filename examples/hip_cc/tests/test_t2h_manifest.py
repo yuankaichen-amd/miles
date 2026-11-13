@@ -59,21 +59,25 @@ def make_store(tmp_path, tasks):
     return root
 
 
-def test_topup_takes_rank_order_same_difficulty_and_pending_holds_the_slot(tmp_path, monkeypatch):
+def test_topup_takes_the_first_passed_task_in_rank_order(tmp_path, monkeypatch):
     tasks = [
         ("t2h/cudaagent/e1", "t2h-eval128", "cudaagent", "easy", None),
         ("t2h/cudaagent/e2", "t2h-eval128", "cudaagent", "hard", None),
         ("t2h/cudaagent/e3", "t2h-eval128", "cudaagent", "easy", None),
-        ("t2h/cudaagent/r0", "reserve", "cudaagent", "easy", 0),   # dropped: skipped
-        ("t2h/cudaagent/r1", "reserve", "cudaagent", "easy", 1),   # pending: holds e1's slot
-        ("t2h/cudaagent/r2", "reserve", "cudaagent", "easy", 2),   # passed but ranked after r1
+        ("t2h/cudaagent/r0", "reserve", "cudaagent", "easy", 0),   # dropped
+        ("t2h/cudaagent/r1", "reserve", "cudaagent", "easy", 1),   # pending: not eligible
+        ("t2h/cudaagent/r2", "reserve", "cudaagent", "easy", 2),   # passed: fills e1
         ("t2h/cudaagent/r3", "reserve", "cudaagent", "hard", 3),   # passed, same difficulty as e2
         ("t2h/cudaagent/r9", "reserve", "cudaagent", "hard", None),  # not in the ranked pool
-        ("t2h/gpumode/g1", "t2h-eval128", "gpumode", "easy", None),
+        ("t2h/gpumode/g1", "t2h-eval128", "gpumode", "easy", None),  # pending in the manifest, a known drop
+        ("t2h/gpumode/q0", "reserve", "gpumode", "easy", 0),        # pending in the manifest, a known drop
+        ("t2h/gpumode/q1", "reserve", "gpumode", "easy", 1),        # passed: fills g1
+        ("t2h/train/t1", "train", "gpumode", "easy", None),
     ]
     root = make_store(tmp_path, tasks)
     monkeypatch.setattr(t2h_manifest, "DATA", tmp_path)
     monkeypatch.setattr(t2h_manifest, "TOPUP_PLAN", root / "eval128-topup-latest.json")
+    monkeypatch.setattr(t2h_manifest, "KNOWN_DROPS", root / "eval128-known-drops.txt")
     manifest = {"version": VERSION, "generated_at": "T1", "rules": {"runs": 3}, "tasks": [
         {"task_id": "t2h/cudaagent/e1", "status": "dropped"},
         {"task_id": "t2h/cudaagent/e2", "status": "dropped"},
@@ -84,24 +88,22 @@ def test_topup_takes_rank_order_same_difficulty_and_pending_holds_the_slot(tmp_p
         passed("t2h/cudaagent/r3", "reserve", "cudaagent"),
         passed("t2h/cudaagent/r9", "reserve", "cudaagent"),
         {"task_id": "t2h/gpumode/g1", "status": "pending"},
+        {"task_id": "t2h/gpumode/q0", "status": "pending"},
+        passed("t2h/gpumode/q1", "reserve", "gpumode"),
+        passed("t2h/train/t1", "train", "gpumode"),
     ]}
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest))
     plan = t2h_manifest.topup(path, VERSION)
     slots = {s["replaces"]: s for s in plan["slots"]}
-    assert slots["t2h/cudaagent/e1"]["task_id"] == "t2h/cudaagent/r1"
-    assert slots["t2h/cudaagent/e1"]["state"] == "pending"
-    assert slots["t2h/cudaagent/e2"]["task_id"] == "t2h/cudaagent/r3"
-    assert slots["t2h/cudaagent/e2"]["state"] == "passed" and slots["t2h/cudaagent/e2"]["same_difficulty"]
-    assert plan["eval128_pending"] == 1 and plan["complete"] is False
+    assert slots["t2h/cudaagent/e1"]["task_id"] == "t2h/cudaagent/r2"
+    assert slots["t2h/cudaagent/e2"]["task_id"] == "t2h/cudaagent/r3" and slots["t2h/cudaagent/e2"]["same_difficulty"]
+    assert "t2h/gpumode/g1" not in slots and plan["eval128_pending"] == 1 and plan["complete"] is False
     assert "SECRET_HIP_REF" not in t2h_manifest.TOPUP_PLAN.read_text()
 
-    # r1 drops later: the slot moves to the next ranked easy candidate, r2.
-    manifest["tasks"][4] = {"task_id": "t2h/cudaagent/r1", "status": "dropped"}
-    manifest["tasks"][8] = passed("t2h/gpumode/g1", "t2h-eval128", "gpumode")
-    manifest["generated_at"] = "T2"
-    path.write_text(json.dumps(manifest))
+    (root / "eval128-known-drops.txt").write_text("# floor drops\nt2h/gpumode/g1\nt2h/gpumode/q0  # backup\n")
     plan = t2h_manifest.topup(path, VERSION)
     slots = {s["replaces"]: s for s in plan["slots"]}
-    assert slots["t2h/cudaagent/e1"]["task_id"] == "t2h/cudaagent/r2"
-    assert plan["complete"] is True
+    assert slots["t2h/gpumode/g1"]["task_id"] == "t2h/gpumode/q1" and slots["t2h/gpumode/g1"]["state"] == "passed"
+    assert plan["complete"] is True and plan["known_drops"] == ["t2h/gpumode/g1", "t2h/gpumode/q0"]
+    assert all(s["task_id"] != "t2h/train/t1" for s in plan["slots"])
