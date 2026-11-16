@@ -73,7 +73,7 @@ class PerfectGLM:
         self.script = list(script)
         self.prompts: list[dict] = []
 
-    def __call__(self, _mock, payload: dict) -> dict:
+    def __call__(self, payload: dict) -> dict:
         from miles.utils.chat_template_utils.tito_tokenizer import extract_template_args
 
         messages, prompt_ids = payload["messages"], list(payload["input_ids"])
