@@ -177,7 +177,7 @@ def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
     async def go():
         h = Harness(tmp_path)
         episode, token = await h.register(max_out=8192, context=131072)
-        previous_client, previous_sent = None, None
+        previous_client, previous_sent, noted = None, None, 0
         for record in records:
             body = record.get("body")
             if record["path"] != "/v1/messages" or body.get("model") != SERVED_MODEL:
@@ -189,13 +189,17 @@ def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
             client = cc_gateway.normalize_request(body)[0]["messages"]
             sent_messages = sent["body"]["messages"]
             assert len(sent_messages) == len(client)
-            if len(client) > 1:
+            if len(client) > 1 and client[-1]["role"] == "user":
                 assert "[harness]" in json.dumps(sent_messages[-1])
+                noted += 1
+            else:
+                assert sent_messages[-1] == client[-1]
             if previous_client is not None and client[:len(previous_client)] == previous_client:
                 assert sent_messages[:len(previous_sent)] == previous_sent
             previous_client, previous_sent = client, sent_messages
         summary = await h.finish(episode)
         assert summary["rejected"] == 0 and not summary["upstream_errors"] and summary["continuations"] == 0
+        assert noted > 0
 
     run(go())
 
@@ -544,7 +548,8 @@ def test_streaming_cut_reasoning_is_continued(tmp_path):
         assert r.headers["content-type"].startswith("text/event-stream")
         events = [json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")]
         assert [e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"] == ["tool_use"]
-        assert "<previous_reasoning>\nstreamed plan\n" in json.dumps(h.mock.received[-1]["body"]["messages"])
+        last = h.mock.received[-1]["body"]["messages"][-1]
+        assert "<previous_reasoning>\nstreamed plan\n" in cc_gateway._message_text(last)
 
     run(go())
 
