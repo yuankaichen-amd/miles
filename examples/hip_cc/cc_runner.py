@@ -432,6 +432,20 @@ def claude_env(spec: EpisodeSpec) -> dict[str, str]:
     return env
 
 
+def system_append(spec: EpisodeSpec) -> str:
+    """Appended to Claude Code's system prompt; its "Context management" section says there is no need to wrap
+    up early and promises a summary, which is false here (auto-compact is off and the episode has hard limits)."""
+    minutes = int(round(spec.wall_s / 60))
+    return (
+        "# Budget for this session (overrides \"Context management\" above)\n"
+        f"This session has hard limits: {minutes} minutes of wall clock and {spec.max_turns} model calls. There is "
+        "no summarization and no further context window; the session simply ends when either limit is reached, and "
+        "only the files on disk at that moment count. Ignore the statement above that you don't need to wrap up "
+        "early: produce a correct, compiled result early, then improve it while time remains. Keep each reasoning "
+        "step short and act on it; do not spend more than a few thousand tokens thinking before a tool call.\n"
+    )
+
+
 RUN_SH = r"""#!/bin/bash
 # Claude Code inside the rollout container; the tokens are read from tmpfs files, never argv.
 set -u
@@ -442,6 +456,7 @@ cd /workspace
 timeout -s TERM -k 15 {wall} claude -p --model "$ANTHROPIC_MODEL" --output-format stream-json --verbose \
   --max-turns {max_turns} --dangerously-skip-permissions --tools "{tools}" --disallowedTools "{disallowed}" \
   --no-session-persistence --disable-slash-commands --strict-mcp-config \
+  --append-system-prompt "$(cat /home/agent/.cc/system_append.md)" \
   < /home/agent/.cc/prompt.md > /tmp/cc/stream.jsonl 2> /tmp/cc/stderr.txt
 rc=$?
 reason=exit; [ $rc -eq 124 ] && reason=wall_clock
@@ -462,6 +477,7 @@ def home_tar(spec: EpisodeSpec, eval_token: str, prompt: str) -> bytes:
         ".cc/gw_token": (spec.gateway_token + "\n", 0o600),
         ".cc/eval_token": (eval_token + "\n", 0o600),
         ".cc/prompt.md": (prompt, 0o644),
+        ".cc/system_append.md": (system_append(spec), 0o644),
         ".cc/run.sh": (RUN_SH.format(exports=exports, wall=int(spec.wall_s), max_turns=int(spec.max_turns),
                                      tools=TOOLS, disallowed=DISALLOWED_TOOLS), 0o755),
         ".claude.json": (json.dumps({"autoCompactEnabled": False, "hasCompletedOnboarding": True,
@@ -625,7 +641,8 @@ class Runner:
                 if rc != 0:
                     raise RuntimeError("/kb is present in the /kb-off container")
             workspace = Path(spec.workspace_dir)
-            prompt = spec.prompt or build_prompt(workspace, with_kb=spec.kb)
+            prompt = spec.prompt or build_prompt(workspace, with_kb=spec.kb, wall_s=spec.wall_s,
+                                                 max_calls=spec.max_turns)
             for target, data in (("/workspace", workspace_tar(workspace, with_kb=spec.kb)),
                                  ("/home/agent", home_tar(spec, proxy.token, prompt))):
                 rc, _, err = await self.docker.run("exec", "-i", name, "tar", "-x", "--no-same-owner", "-C", target,
@@ -696,10 +713,10 @@ class Runner:
         return files
 
 
-def build_prompt(workspace: Path, *, with_kb: bool = True) -> str:
+def build_prompt(workspace: Path, *, with_kb: bool = True, wall_s: float = 1200, max_calls: int = 40) -> str:
     from cc_prompt import build_prompt as build  # noqa: PLC0415
 
-    return build(workspace, with_kb=with_kb)
+    return build(workspace, with_kb=with_kb, wall_s=wall_s, max_calls=max_calls)
 
 
 async def amain(args) -> None:

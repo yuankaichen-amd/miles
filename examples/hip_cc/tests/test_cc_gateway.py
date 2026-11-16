@@ -131,7 +131,8 @@ def test_replay_captured_session(path, tmp_path):
 
     async def go():
         h = Harness(tmp_path)
-        episode, token = await h.register(max_out=8192, context=131072)
+        episode, token = await h.register(max_out=8192, context=131072, reasoning_cap=0, continue_max=0,
+                                          reminders=False)
         served = 0
         for record in records:
             body = record.get("body")
@@ -163,6 +164,38 @@ def test_replay_captured_session(path, tmp_path):
         events = [json.loads(line)["event"] for line in (h.log_dir / f"{episode}.jsonl").read_text().splitlines()]
         assert events[0] == "register" and events[-1] == "finish"
         assert events.count("request") == served == events.count("response")
+
+    run(go())
+
+
+@pytest.mark.parametrize("path", captured_logs(), ids=lambda p: p.name.split(".")[0])
+def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
+    """With reminders on, every request still passes Miles validation, and whenever the client's history
+    extends its previous request, what the session server sees extends what it saw before."""
+    records = load(path)
+
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=8192, context=131072)
+        previous_client, previous_sent = None, None
+        for record in records:
+            body = record.get("body")
+            if record["path"] != "/v1/messages" or body.get("model") != SERVED_MODEL:
+                continue
+            r = await h.call(episode, token, body)
+            assert r.status_code == 200, r.text
+            sent = h.mock.received[-1]
+            assert sent["miles_verdict"] == "ok", sent["miles_verdict"]
+            client = cc_gateway.normalize_request(body)[0]["messages"]
+            sent_messages = sent["body"]["messages"]
+            assert len(sent_messages) == len(client)
+            if len(client) > 1:
+                assert "[harness]" in json.dumps(sent_messages[-1])
+            if previous_client is not None and client[:len(previous_client)] == previous_client:
+                assert sent_messages[:len(previous_sent)] == previous_sent
+            previous_client, previous_sent = client, sent_messages
+        summary = await h.finish(episode)
+        assert summary["rejected"] == 0 and not summary["upstream_errors"] and summary["continuations"] == 0
 
     run(go())
 
@@ -388,3 +421,199 @@ def test_requests_off_the_allowlist_are_logged(tmp_path):
         ("GET", "/sessions/s1/samples", 404), ("POST", "/flush_cache", 404), ("POST", "/episodes", 401),
         ("GET", "/episodes/ep1", 401), ("POST", "/e/ep1/v1/messages", 401), ("GET", "/e/ep1/v1/messages", 405)]
     assert token not in text and ADMIN not in text and "wrong" not in text
+
+
+# ---------------- reasoning cap, continuation of cut-off replies, harness notes ----------------
+
+NUDGE = ("Output token limit hit. Resume directly \u2014 no apology, no recap of what you were doing. Pick up "
+         "mid-thought if that is where the cut happened. Break remaining work into smaller pieces.")
+
+
+def thinking(text):
+    return {"type": "thinking", "thinking": text, "signature": "sig"}
+
+
+def tool(name, args):
+    return {"type": "tool_use", "id": f"toolu_{abs(hash((name, json.dumps(args)))) % 10**12:012d}",
+            "name": name, "input": args}
+
+
+def result_for(block, text="ok"):
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": block["id"], "content": text}]}
+
+
+def events_of(h, episode):
+    return [json.loads(line) for line in (h.log_dir / f"{episode}.jsonl").read_text().splitlines()]
+
+
+def test_cut_reasoning_is_carried_into_a_gateway_retry(tmp_path):
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=1000, reasoning_cap=100, reminders=False)
+        write = tool("Write", {"file_path": "/workspace/solution/kernel.hip", "content": "k"})
+        h.mock.replies = [([thinking("R1 tiling plan")], "max_tokens"), ([thinking("short"), write], "tool_use")]
+        body = simple_body("task")
+        reply = (await h.call(episode, token, body)).json()
+        assert reply["stop_reason"] == "tool_use" and reply["content"][1]["id"] == write["id"]
+        first, second = (r["body"] for r in h.mock.received)
+        assert first["max_tokens"] == second["max_tokens"] == 100
+        assert first["messages"] == body["messages"]
+        note = second["messages"][-1]["content"][-1]["text"]
+        assert note.startswith("task\n\n[harness] Your previous reply hit the 100-token reasoning cap")
+        assert note.endswith("<previous_reasoning>\nR1 tiling plan\n</previous_reasoning>")
+        assert all(r["miles_verdict"] == "ok" for r in h.mock.received)
+
+        body2 = {**body, "messages": body["messages"] + [{"role": "assistant", "content": reply["content"]},
+                                                         result_for(write)]}
+        await h.call(episode, token, body2)
+        third = h.mock.received[-1]["body"]["messages"]
+        assert third[0] == second["messages"][0]
+        assert third[2] == body2["messages"][2]
+        summary = await h.finish(episode)
+        assert summary["calls"] == 3 and summary["continuations"] == 1
+        (cont,) = [e for e in events_of(h, episode) if e["event"] == "continue"]
+        assert cont["round"] == 1 and cont["cut_in_reasoning"] and cont["limit"] == 100
+
+    run(go())
+
+
+def test_cut_while_acting_under_the_cap_retries_with_full_output(tmp_path):
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=1000, reasoning_cap=100, reminders=False)
+        compile_ = tool("Bash", {"command": "aka-eval compile"})
+        h.mock.replies = [([thinking("plan"), compile_], "max_tokens"), ([compile_], "tool_use")]
+        reply = (await h.call(episode, token, simple_body("task"))).json()
+        assert reply["stop_reason"] == "tool_use"
+        first, second = (r["body"] for r in h.mock.received)
+        assert (first["max_tokens"], second["max_tokens"]) == (100, 1000)
+        note = second["messages"][-1]["content"][-1]["text"]
+        assert "100-token output cap" in note and "<previous_reasoning>\nplan\n" in note
+
+    run(go())
+
+
+def test_continuations_are_bounded_and_the_client_retry_keeps_the_carry(tmp_path):
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=500, reasoning_cap=0, continue_max=2, reminders=False)
+        bash = tool("Bash", {"command": "ls"})
+        h.mock.replies = [([thinking("A")], "max_tokens"), ([thinking("B")], "max_tokens"),
+                          ([thinking("C")], "max_tokens"), ([bash], "tool_use")]
+        body = simple_body("task")
+        reply = (await h.call(episode, token, body)).json()
+        assert reply["stop_reason"] == "max_tokens" and reply["content"][0]["thinking"] == "C"
+        assert [r["body"]["max_tokens"] for r in h.mock.received] == [500, 500, 500]
+        # Claude Code drops the thinking-only reply and appends its nudge to the last user turn.
+        retry = {**body, "messages": [{"role": "user", "content": body["messages"][0]["content"] + [
+            {"type": "text", "text": NUDGE}]}]}
+        reply = (await h.call(episode, token, retry)).json()
+        assert reply["stop_reason"] == "tool_use"
+        last = h.mock.received[-1]["body"]["messages"][-1]["content"]
+        assert last[0] == {"type": "text", "text": "task"} and last[1]["text"].startswith(NUDGE)
+        assert "<previous_reasoning>\nA\n\nB\n\nC\n</previous_reasoning>" in last[1]["text"]
+        summary = await h.finish(episode)
+        assert summary["calls"] == 4 and summary["continuations"] == 2
+
+    run(go())
+
+
+def test_no_continuation_when_disabled_or_out_of_calls(tmp_path):
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(reasoning_cap=0, continue_max=0)
+        h.mock.replies = [([thinking("A")], "max_tokens")]
+        assert (await h.call(episode, token, simple_body())).json()["stop_reason"] == "max_tokens"
+        assert len(h.mock.received) == 1
+        episode, token = await h.register("ep2", "tok-2", reasoning_cap=0, max_calls=1)
+        h.mock.replies = [([thinking("A")], "max_tokens")]
+        assert (await h.call(episode, token, simple_body())).json()["stop_reason"] == "max_tokens"
+        assert len(h.mock.received) == 2
+        assert (await h.finish(episode))["continuations"] == 0
+
+    run(go())
+
+
+def test_streaming_cut_reasoning_is_continued(tmp_path):
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=1000, reasoning_cap=100, reminders=False)
+        bash = tool("Bash", {"command": "ls"})
+        h.mock.replies = [([thinking("streamed plan")], "max_tokens"), ([bash], "tool_use")]
+        r = await h.call(episode, token, simple_body("task", stream=True))
+        assert r.headers["content-type"].startswith("text/event-stream")
+        events = [json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")]
+        assert [e["delta"]["stop_reason"] for e in events if e["type"] == "message_delta"] == ["tool_use"]
+        assert "<previous_reasoning>\nstreamed plan\n" in json.dumps(h.mock.received[-1]["body"]["messages"])
+
+    run(go())
+
+
+def test_reminders_report_time_calls_and_progress(tmp_path):
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(reasoning_cap=0, max_calls=40, wall_s=1200)
+        body = simple_body("task")
+        await h.call(episode, token, body)
+        assert h.mock.received[-1]["body"]["messages"] == body["messages"]
+
+        def note_of_last():
+            content = h.mock.received[-1]["body"]["messages"][-1]["content"]
+            return content[-1]["content"]
+
+        messages = list(body["messages"])
+        steps = [
+            (tool("Read", {"file_path": "/workspace/README.md"}), "solution/kernel.hip has not been written yet."),
+            (tool("Read", {"file_path": "/kb/INDEX.md"}), "Write a simple correct kernel"),
+            (tool("Bash", {"command": "cat > solution/kernel.hip <<'EOF'\nx\nEOF"}), "has not been compiled yet"),
+            (tool("Bash", {"command": "aka-eval compile"}), "No correctness check has been run yet"),
+            (tool("Bash", {"command": "aka-eval correctness"}), None),
+        ]
+        sent_before = None
+        for index, (block, expected) in enumerate(steps):
+            if index == 1:
+                h.gateway.episodes[episode].created -= 600
+            messages += [{"role": "assistant", "content": [block]}, result_for(block, "out")]
+            await h.call(episode, token, {**body, "messages": messages})
+            sent = h.mock.received[-1]["body"]["messages"]
+            note = note_of_last()
+            assert note.startswith("out\n\n[harness] ") and f"of 40 model calls left." in note
+            assert f"{40 - index - 1} of 40 model calls left." in note
+            if expected:
+                assert expected in note
+            else:
+                assert note.endswith("model calls left.")
+            if sent_before is not None:
+                assert sent[:len(sent_before)] == sent_before
+            sent_before = sent
+        assert "10m" in note_of_last() and "of 20m used" in note_of_last()
+
+    run(go())
+
+
+def test_append_note_forms():
+    note = "[harness] n"
+    assert cc_gateway._append_note({"role": "user", "content": "a"}, note)["content"] == "a\n\n[harness] n"
+    text = cc_gateway._append_note({"role": "user", "content": [{"type": "text", "text": "a"}]}, note)
+    assert text["content"] == [{"type": "text", "text": "a\n\n[harness] n"}]
+    res = {"type": "tool_result", "tool_use_id": "t"}
+    assert cc_gateway._append_note({"role": "user", "content": [{**res, "content": "o"}]}, note)["content"][0][
+        "content"] == "o\n\n[harness] n"
+    assert cc_gateway._append_note({"role": "user", "content": [res]}, note)["content"][0]["content"] == note
+    listed = cc_gateway._append_note({"role": "user", "content": [{**res, "content": [{"type": "text", "text": "o"}]}]},
+                                     note)
+    assert listed["content"][0]["content"] == [{"type": "text", "text": "o"}, {"type": "text", "text": note}]
+    original = {"role": "user", "content": [{"type": "text", "text": "a"}]}
+    cc_gateway._append_note(original, note)
+    assert original == {"role": "user", "content": [{"type": "text", "text": "a"}]}
+
+
+def test_progress_detection():
+    def assistant(*blocks):
+        return {"role": "assistant", "content": list(blocks)}
+
+    assert cc_gateway._progress([assistant(tool("Read", {"file_path": "solution/kernel.hip"}))]) == \
+        {"kernel": False, "compile": False, "correctness": False}
+    assert cc_gateway._progress([assistant(tool("Edit", {"file_path": "/workspace/solution/kernel.hip"}))])["kernel"]
+    assert cc_gateway._progress([assistant(tool("Bash", {"command": "tee solution/kernel.hip < x"}))])["kernel"]
+    assert not cc_gateway._progress([assistant(tool("Bash", {"command": "cat solution/kernel.hip"}))])["kernel"]

@@ -31,7 +31,24 @@ def hardware_context(with_kb: bool = True) -> str:
     return text
 
 
-def build_prompt(workspace: Path, *, with_kb: bool = True) -> str:
+def budget_section(wall_s: float, max_calls: int) -> list[str]:
+    minutes = int(round(wall_s / 60))
+    return [
+        "Budget (hard limits; the session is cut off without warning when either runs out):",
+        f"- {minutes} minutes of wall clock and {max_calls} model calls in total. Reasoning is generated at about "
+        "100 tokens per second, so long reasoning uses up both: 6,000 tokens of thinking take a minute.",
+        "- Only the final solution/kernel.hip is graded. If time runs out before you have written a kernel that "
+        "compiles and is correct, the episode scores 0 however good your plan was.",
+        "- So work in this order: (1) within the first few minutes, write a simple, straightforward kernel that "
+        "is correct (plain loops over global memory are fine) to solution/kernel.hip and run `aka-eval compile`; "
+        "(2) fix it until `aka-eval correctness` passes; (3) only then optimize, re-checking correctness after each "
+        "change, and stop optimizing well before the time runs out.",
+        "- Prefer short reasoning followed by an action. You will see the time and calls left after each tool result.",
+        "",
+    ]
+
+
+def build_prompt(workspace: Path, *, with_kb: bool = True, wall_s: float = 1200, max_calls: int = 40) -> str:
     readme = (workspace / "README.md").read_text()
     if not with_kb:
         from cc_workspace import KB_POINTER  # noqa: PLC0415
@@ -47,6 +64,7 @@ def build_prompt(workspace: Path, *, with_kb: bool = True) -> str:
         "Editable implementation:",
         "- solution/kernel.hip: implementation file (the only file that is graded)",
         "",
+        *budget_section(wall_s, max_calls),
         "Task instructions from README.md:",
         readme,
         "Candidate checks (run from /workspace):",

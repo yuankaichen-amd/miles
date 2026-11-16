@@ -13,7 +13,19 @@ per-episode bearer token. The gateway
 * enforces the per-episode budgets: model calls, the per-call output clamp
   ``min(max_out, W - input - 256)``, the stop rule (input above W - margin ends
   the episode with a synthetic, unrecorded end_turn) and the wall clock,
+* caps reasoning per call (``reasoning_cap``): a reply cut off at the cap, or
+  cut off inside its reasoning at max_out, is not handed to Claude Code (which
+  drops a thinking-only reply and asks again from scratch). The gateway asks
+  again itself, with the cut-off reasoning carried in a harness note on the last
+  user turn, up to ``continue_max`` times per turn,
+* appends a harness note with the time and calls left to the last user turn,
 * forwards to ``<session_url>/v1/messages`` and logs every request and reply.
+
+Harness notes change the history the session server sees, so each one is
+recorded under (position, sha of the client's history before it) and applied
+again to that user turn in every later request: the session tree only ever sees
+one consistent history (the session server never extends a truncated node, so
+the cut-off reply stays a leaf and the retry is its sibling).
 
 Admin routes (``/episodes``) need the admin token from ``--admin-token-file``;
 containers only ever see ``/e/<episode>/...`` through the forwarder.
@@ -29,6 +41,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -215,6 +228,9 @@ class Episode:
     stop_margin: int = 4096
     max_calls: int = 40
     wall_s: float = 1200.0
+    reasoning_cap: int = 8192
+    continue_max: int = 2
+    reminders: bool = True
     created: float = field(default_factory=time.time)
     calls: int = 0
     stub_calls: int = 0
@@ -232,6 +248,9 @@ class Episode:
     stop_reasons: dict = field(default_factory=dict)
     first_messages_sha: str | None = None
     roots: int = 0
+    continuations: int = 0
+    notes: dict = field(default_factory=dict)
+    carry: dict = field(default_factory=dict)
     log: Any = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -241,7 +260,7 @@ class Episode:
             "upstream_errors": self.upstream_errors, "stop_reason": self.stop_reason,
             "max_input_tokens": self.max_input_tokens, "output_tokens": self.output_tokens,
             "tool_uses": self.tool_uses, "stop_reasons": self.stop_reasons, "roots_est": self.roots,
-            "wall_s": round(time.time() - self.created, 1),
+            "continuations": self.continuations, "wall_s": round(time.time() - self.created, 1),
         }
 
 
@@ -276,6 +295,9 @@ class Gateway:
         known = {f for f in Episode.__dataclass_fields__ if f not in ("token_sha256",)}
         params = {k: v for k, v in body.items() if k in known}
         params.setdefault("model", self.args.served_model)
+        for name in ("reasoning_cap", "continue_max", "reminders"):
+            if getattr(self.args, name, None) is not None:
+                params.setdefault(name, getattr(self.args, name))
         episode = Episode(token_sha256=token_sha, **params)
         episode.log = (self.log_dir / f"{_safe(episode.episode)}.jsonl").open("a", buffering=1)
         self.episodes[episode.episode] = episode
@@ -353,17 +375,107 @@ class Gateway:
             episode.rejected += 1
             self._log(episode, {"event": "rejected", "reason": str(exc)})
             return _anthropic_error(400, "invalid_request_error", str(exc))
-        input_est = self._input_estimate(episode, normalized)
-        window = episode.context
-        if input_est > window - episode.stop_margin:
-            return self._stop(episode, "context_limit", body, stream, input_est=input_est)
-        requested = int(normalized.get("max_tokens") or episode.max_out)
-        normalized["max_tokens"] = max(1, min(requested, episode.max_out, window - input_est - 256))
-
-        messages_sha = sha256(json.dumps(normalized.get("messages", [])[:1], sort_keys=True))
+        client_messages = normalized.get("messages", [])
+        messages_sha = sha256(json.dumps(client_messages[:1], sort_keys=True))
         if episode.first_messages_sha != messages_sha:
             episode.roots += 1
             episode.first_messages_sha = messages_sha
+        requested = int(normalized.get("max_tokens") or episode.max_out)
+        previous: tuple[httpx.Response, dict] | None = None
+        while True:
+            normalized["messages"], note = self._apply_notes(episode, client_messages)
+            input_est = self._input_estimate(episode, normalized)
+            window = episode.context
+            if input_est > window - episode.stop_margin:
+                if previous is not None:
+                    return self._reply(previous[0], stream)
+                return self._stop(episode, "context_limit", body, stream, input_est=input_est)
+            full = max(1, min(requested, episode.max_out, window - input_est - 256))
+            capped = previous is None or previous[1]["cut_in_reasoning"]
+            limit = min(full, episode.reasoning_cap) if (episode.reasoning_cap and capped) else full
+            normalized["max_tokens"] = limit
+            sent = await self._forward(episode, normalized, input_est, note, continuation=previous is not None,
+                                       norm_stats=norm_stats)
+            if isinstance(sent, Response):
+                return self._reply(previous[0], stream) if previous is not None else sent
+            upstream, reply = sent
+            cut = reply["stop_reason"] == "max_tokens" and (reply["cut_in_reasoning"] or limit < full)
+            if not cut:
+                return self._reply(upstream, stream)
+            may_continue = self._may_continue(episode, client_messages)
+            self._carry(episode, client_messages, reply, limit)
+            if not may_continue:
+                return self._reply(upstream, stream)
+            episode.continuations += 1
+            previous = (upstream, reply)
+
+    def _may_continue(self, episode: Episode, client_messages: list) -> bool:
+        key = _turn_key(client_messages)
+        return (key is not None and episode.carry.get(key, {}).get("rounds", 0) < episode.continue_max
+                and episode.calls < episode.max_calls and time.time() - episode.created < episode.wall_s)
+
+    def _carry(self, episode: Episode, client_messages: list, reply: dict, limit: int) -> None:
+        key = _turn_key(client_messages)
+        if key is None:
+            return
+        entry = episode.carry.setdefault(key, {"rounds": 0, "reasoning": []})
+        entry["rounds"] += 1
+        if reply["thinking"]:
+            entry["reasoning"].append(reply["thinking"])
+        entry["limit"] = limit
+        entry["acting"] = not reply["cut_in_reasoning"]
+        self._log(episode, {"event": "continue", "call": episode.calls, "position": key[0], "round": entry["rounds"],
+                            "limit": limit, "cut_in_reasoning": reply["cut_in_reasoning"],
+                            "carried_chars": sum(len(r) for r in entry["reasoning"])})
+
+    def _apply_notes(self, episode: Episode, client_messages: list) -> tuple[list, str | None]:
+        """The client's history with every recorded harness note re-applied, plus a fresh note on the last user
+        turn (recorded for later requests). Only the last user turn's note is recomputed."""
+        out = list(client_messages)
+        last = len(out) - 1
+        for index, message in enumerate(out[:last]):
+            if message.get("role") != "user":
+                continue
+            recorded = episode.notes.get((index, _messages_sha(client_messages[:index])))
+            if recorded and recorded["orig"] == _messages_sha([message]):
+                out[index] = _append_note(message, recorded["text"])
+        if last < 0 or out[last].get("role") != "user":
+            return out, None
+        key = (last, _messages_sha(client_messages[:last]))
+        parts = []
+        if episode.reminders and last > 0:
+            parts.append(self._reminder(episode, client_messages))
+        carried = episode.carry.get(key)
+        if carried and carried["reasoning"]:
+            parts.append(_carry_text(carried))
+        if not parts:
+            episode.notes.pop(key, None)
+            return out, None
+        text = "\n\n".join(parts)
+        episode.notes[key] = {"orig": _messages_sha([client_messages[last]]), "text": text}
+        out[last] = _append_note(client_messages[last], text)
+        return out, text
+
+    def _reminder(self, episode: Episode, client_messages: list) -> str:
+        elapsed = time.time() - episode.created
+        left = max(0, episode.max_calls - episode.calls)
+        progress = _progress(client_messages)
+        text = (f"[harness] {int(elapsed // 60)}m{int(elapsed % 60):02d}s of {episode.wall_s / 60:g}m used; "
+                f"{left} of {episode.max_calls} model calls left.")
+        late = elapsed > 0.25 * episode.wall_s or left < 0.75 * episode.max_calls
+        if not progress["kernel"]:
+            text += " solution/kernel.hip has not been written yet."
+            if late:
+                text += (" Write a simple correct kernel to solution/kernel.hip now and run `aka-eval compile`;"
+                         " optimize only after `aka-eval correctness` passes.")
+        elif not progress["compile"]:
+            text += " The kernel has not been compiled yet: run `aka-eval compile`."
+        elif not progress["correctness"]:
+            text += " No correctness check has been run yet: run `aka-eval correctness`."
+        return text
+
+    async def _forward(self, episode: Episode, normalized: dict, input_est: int, note: str | None,
+                       continuation: bool, norm_stats: dict) -> tuple[httpx.Response, dict] | Response:
         episode.calls += 1
         call_index = episode.calls
         log_request = normalized if (self.args.log_full or call_index == 1) else {
@@ -376,7 +488,8 @@ class Gateway:
             log_request.pop("system", None)
             log_request.pop("tools", None)
         self._log(episode, {"event": "request", "call": call_index, "normalize": norm_stats,
-                            "input_est": input_est, "max_tokens": normalized["max_tokens"], "request": log_request})
+                            "input_est": input_est, "max_tokens": normalized["max_tokens"],
+                            "continuation": continuation, "note": note, "request": log_request})
         started = time.time()
         try:
             upstream = await self.client.post(
@@ -400,7 +513,9 @@ class Gateway:
                                 "body": content[:4000].decode(errors="replace")})
             return Response(content=content, status_code=upstream.status_code,
                             media_type=upstream.headers.get("content-type", "application/json"))
+        reply = _response_message(content, upstream.headers.get("content-type", ""))
         summary = _response_summary(content, upstream.headers.get("content-type", ""))
+        summary["cut_in_reasoning"] = reply["cut_in_reasoning"]
         episode.last_input_tokens = summary.get("input_tokens") or input_est
         episode.last_output_tokens = summary.get("output_tokens") or 0
         episode.last_message_count = len(normalized.get("messages", []))
@@ -413,10 +528,14 @@ class Gateway:
         episode.stop_reasons[reason] = episode.stop_reasons.get(reason, 0) + 1
         self._log(episode, {"event": "response", "call": call_index, "elapsed_s": round(elapsed, 3),
                             "summary": summary, "body": content.decode(errors="replace")})
+        return upstream, reply
+
+    @staticmethod
+    def _reply(upstream: httpx.Response, stream: bool) -> Response:
         media_type = "text/event-stream" if stream else "application/json"
         if not stream and upstream.headers.get("content-type", "").startswith("text/event-stream"):
             media_type = "text/event-stream"
-        return Response(content=content, status_code=200, media_type=media_type,
+        return Response(content=upstream.content, status_code=200, media_type=media_type,
                         headers={"cache-control": "no-cache"} if stream else None)
 
     def _input_estimate(self, episode: Episode, normalized: dict) -> int:
@@ -448,6 +567,108 @@ class Gateway:
 
 def _messages_sha(messages: list) -> str:
     return sha256(json.dumps(messages, sort_keys=True, separators=(",", ":")))
+
+
+def _turn_key(client_messages: list) -> tuple[int, str] | None:
+    """Identifies the last user turn by its position and the client history before it."""
+    last = len(client_messages) - 1
+    if last < 0 or client_messages[last].get("role") != "user":
+        return None
+    return last, _messages_sha(client_messages[:last])
+
+
+def _append_note(message: dict, note: str) -> dict:
+    """``message`` with ``note`` appended to its last text or tool result, so no new turn is created."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return {**message, "content": f"{content}\n\n{note}"}
+    blocks = list(content or [])
+    last = blocks[-1] if blocks else None
+    if last and last.get("type") == "text":
+        blocks[-1] = {**last, "text": f"{last.get('text', '')}\n\n{note}"}
+    elif last and last.get("type") == "tool_result":
+        inner = last.get("content")
+        if inner is None or isinstance(inner, str):
+            inner = f"{inner}\n\n{note}" if inner else note
+        else:
+            inner = [*inner, {"type": "text", "text": note}]
+        blocks[-1] = {**last, "content": inner}
+    else:
+        blocks.append({"type": "text", "text": note})
+    return {**message, "content": blocks}
+
+
+def _carry_text(carried: dict) -> str:
+    reasoning = "\n\n".join(carried["reasoning"])
+    if carried.get("acting"):
+        head = (f"[harness] Your previous reply hit the {carried['limit']}-token output cap for one call and was cut "
+                "off before its tool call completed. Your reasoning from that reply is below; do not redo it. Make "
+                "the tool call now, keeping it short (write a large file in parts if needed).")
+    else:
+        head = (f"[harness] Your previous reply hit the {carried['limit']}-token reasoning cap for one call and was "
+                "cut off before you acted. Your reasoning so far is below; do not redo it. Finish the thought in a "
+                "few sentences and act now: make the next tool call (if no kernel is written yet, write a simple "
+                "correct solution/kernel.hip and run `aka-eval compile`).")
+    return f"{head}\n<previous_reasoning>\n{reasoning}\n</previous_reasoning>"
+
+
+KERNEL_WRITE = re.compile(r"(>|tee\s+(-a\s+)?)\s*\S*solution/kernel\.hip")
+
+
+def _progress(client_messages: list) -> dict:
+    """Whether the policy has written solution/kernel.hip, compiled and checked it, from its own tool calls."""
+    seen = {"kernel": False, "compile": False, "correctness": False}
+    for message in client_messages:
+        if message.get("role") != "assistant" or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if block.get("type") != "tool_use":
+                continue
+            args = block.get("input") or {}
+            if block.get("name") in ("Write", "Edit", "MultiEdit") and \
+                    str(args.get("file_path", "")).endswith("solution/kernel.hip"):
+                seen["kernel"] = True
+            command = str(args.get("command", "")) if block.get("name") == "Bash" else ""
+            if KERNEL_WRITE.search(command):
+                seen["kernel"] = True
+            if "aka-eval compile" in command:
+                seen["compile"] = True
+            if "aka-eval correctness" in command:
+                seen["correctness"] = True
+    return seen
+
+
+def _response_message(content: bytes, content_type: str) -> dict:
+    """Stop reason and reasoning text of a JSON or SSE Messages reply, and whether it was cut off inside its
+    reasoning (only thinking blocks, stopped at max_tokens)."""
+    kinds: list[str] = []
+    thinking: list[str] = []
+    stop = None
+    try:
+        if content_type.startswith("text/event-stream") or content.startswith(b"event:"):
+            for chunk in content.decode().split("\n\n"):
+                data = next((line[5:].strip() for line in chunk.splitlines() if line.startswith("data:")), None)
+                if not data:
+                    continue
+                event = json.loads(data)
+                if event.get("type") == "content_block_start":
+                    kinds.append(event["content_block"].get("type"))
+                    thinking.append(event["content_block"].get("thinking") or "")
+                elif event.get("type") == "content_block_delta" and event["delta"].get("type") == "thinking_delta":
+                    thinking[-1] += event["delta"].get("thinking", "")
+                elif event.get("type") == "message_delta":
+                    stop = event.get("delta", {}).get("stop_reason")
+        else:
+            message = json.loads(content)
+            stop = message.get("stop_reason")
+            for block in message.get("content", []):
+                kinds.append(block.get("type"))
+                thinking.append(block.get("thinking") or "")
+    except (ValueError, KeyError, AttributeError, IndexError):
+        return {"stop_reason": stop, "thinking": "", "cut_in_reasoning": False}
+    text = "\n".join(t for k, t in zip(kinds, thinking) if k == "thinking" and t)
+    cut = stop == "max_tokens" and bool(kinds) and all(k == "thinking" for k in kinds)
+    return {"stop_reason": stop, "thinking": text, "cut_in_reasoning": cut}
 
 
 def _safe(name: str) -> str:
@@ -572,6 +793,11 @@ def parse_args(argv=None):
     parser.add_argument("--log-dir", default="/tmp/cc_gateway_logs")
     parser.add_argument("--log-full", action="store_true", help="Log full requests, not deltas.")
     parser.add_argument("--upstream-read-timeout", type=float, default=1800.0)
+    parser.add_argument("--reasoning-cap", type=int, default=int(os.environ.get("CC_REASONING_CAP", "8192")),
+                        help="Output cap of a call's first attempt; 0 turns the cap off.")
+    parser.add_argument("--continue-max", type=int, default=int(os.environ.get("CC_CONTINUE_MAX", "2")),
+                        help="Gateway retries per turn after a reply is cut off; 0 hands every reply to the client.")
+    parser.add_argument("--reminders", type=int, choices=(0, 1), default=int(os.environ.get("CC_REMINDERS", "1")))
     return parser.parse_args(argv)
 
 

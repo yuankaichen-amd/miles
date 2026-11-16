@@ -320,6 +320,29 @@ def test_claude_env_and_run_script_carry_no_secret(tmp_path):
     assert "--disallowedTools" in script and "gw_token" in script
 
 
+def test_budgets_reach_prompt_and_system_prompt(tmp_path):
+    proxy = make_proxy(tmp_path, FakeClient())
+    spec = proxy.spec
+    spec.wall_s, spec.max_turns = 1200, 40
+    ws = Path(spec.workspace_dir)
+    (ws / "README.md").write_text("# t2h/x/y\n\nintro\n")
+    prompt = cc_runner.build_prompt(ws, wall_s=spec.wall_s, max_calls=spec.max_turns)
+    assert "20 minutes of wall clock and 40 model calls" in prompt
+    assert prompt.index("Budget (hard limits") < prompt.index("Task instructions from README.md")
+    assert "run `aka-eval compile`" in prompt and "`aka-eval correctness` passes" in prompt
+    assert "10 minutes of wall clock and 12 model calls" in cc_runner.build_prompt(ws, wall_s=600, max_calls=12)
+
+    append = cc_runner.system_append(spec)
+    assert "20 minutes of wall clock and 40 model calls" in append
+    assert "don't need to wrap up early" in append and "Context management" in append
+    script = cc_runner.RUN_SH.format(exports="", wall=1200, max_turns=40, tools=cc_runner.TOOLS,
+                                     disallowed=cc_runner.DISALLOWED_TOOLS)
+    assert '--append-system-prompt "$(cat /home/agent/.cc/system_append.md)"' in script
+    with tarfile.open(fileobj=io.BytesIO(cc_runner.home_tar(spec, "eval-token", prompt))) as tar:
+        assert tar.extractfile(".cc/system_append.md").read().decode() == append
+        assert tar.extractfile(".cc/prompt.md").read().decode() == prompt
+
+
 def test_kb_off_episode_hides_every_kb_pointer(tmp_path):
     from cc_workspace import KB_POINTER  # noqa: PLC0415
 

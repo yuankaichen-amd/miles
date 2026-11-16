@@ -238,6 +238,8 @@ class MockServer:
         self.log = open(log_path, "a", buffering=1) if log_path else None
         self.received: list[dict] = []
         self.fail_next: list[int] = []
+        # Canned served-model replies, used in order before the scenario script: (content blocks, stop_reason).
+        self.replies: list[tuple[list[dict], str]] = []
 
     def _record(self, request: Request, raw: bytes, extra: dict) -> None:
         record = {"t": time.time(), "method": request.method, "path": request.url.path,
@@ -264,6 +266,10 @@ class MockServer:
                                 status_code=400)
         body = json.loads(raw)
         message = build_message(body, self.thinking)
+        if self.replies and body.get("model") == SERVED_MODEL:
+            blocks, stop = self.replies.pop(0)
+            message.update(content=blocks, stop_reason=stop,
+                           usage={**message["usage"], "output_tokens": max(1, len(json.dumps(blocks)) // 4)})
         if body.get("stream"):
             return Response(sse_body(message), media_type="text/event-stream")
         return JSONResponse(message)
