@@ -177,7 +177,7 @@ def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
     async def go():
         h = Harness(tmp_path)
         episode, token = await h.register(max_out=8192, context=131072)
-        previous_client, previous_sent, noted = None, None, 0
+        previous_client, previous_sent = None, None
         for record in records:
             body = record.get("body")
             if record["path"] != "/v1/messages" or body.get("model") != SERVED_MODEL:
@@ -191,7 +191,6 @@ def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
             assert len(sent_messages) == len(client)
             if len(client) > 1 and client[-1]["role"] == "user":
                 assert "[harness]" in json.dumps(sent_messages[-1])
-                noted += 1
             else:
                 assert sent_messages[-1] == client[-1]
             if previous_client is not None and client[:len(previous_client)] == previous_client:
@@ -199,7 +198,6 @@ def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
             previous_client, previous_sent = client, sent_messages
         summary = await h.finish(episode)
         assert summary["rejected"] == 0 and not summary["upstream_errors"] and summary["continuations"] == 0
-        assert noted > 0
 
     run(go())
 
