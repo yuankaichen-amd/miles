@@ -73,11 +73,14 @@ assert limit >= int(sys.argv[2]), f"max_position_embeddings {limit} < CC_CONTEXT
 print(f"context gate: max_position_embeddings {limit}, rope_scaling {config.get('rope_scaling')}, CC_CONTEXT {sys.argv[2]}")
 EOF
 
-python3 - "${CC_TASKS}" <<'EOF'
+# Same allowlist as hip_cc_phase0.PHASE0_SPLITS (the host python here has no httpx to import it).
+python3 - "${CC_TASKS}" "${CC_STEP}" <<'EOF'
 import json, sys
+allowed = {"0a": {"train"}, "0b": {"train", "t2h-eval128", "heldout150-t2h", "kernelbench-t2h"}}.get(sys.argv[2])
+assert allowed, f"unknown Phase 0 step {sys.argv[2]!r}"
 splits = {json.loads(line)["label"]["split"] for line in open(sys.argv[1]) if line.strip()}
-assert splits == {"train"}, f"Phase 0 samples train tasks only; {sys.argv[1]} has {sorted(splits)}"
-print(f"task gate: train only, {sum(1 for line in open(sys.argv[1]) if line.strip())} tasks")
+assert splits and splits <= allowed, f"Phase {sys.argv[2]} samples only {sorted(allowed)}; {sys.argv[1]} has {sorted(splits)}"
+print(f"task gate: Phase {sys.argv[2]}, splits {sorted(splits)}, {sum(1 for line in open(sys.argv[1]) if line.strip())} tasks")
 EOF
 
 echo "== role map (job ${SLURM_JOB_ID}, Phase ${CC_STEP})"
@@ -176,6 +179,7 @@ echo "ready: ${SESSION_URLS}; cc nodes:"; cat "${CC_RUN_DIR}/cc_nodes.txt"
 if [ "${CC_HOLD:-0}" = 1 ]; then
   cat > "${RUN_DIR}/job.env" <<EOF
 JOB=${SLURM_JOB_ID}
+CC_STEP=${CC_STEP}
 NODE=${ROLL_NODES[0]}
 RUN_DIR=${RUN_DIR}
 CC_RUN_DIR=${CC_RUN_DIR}
@@ -203,7 +207,7 @@ docker run --rm --name "cc_drv_${SLURM_JOB_ID}" --network host --user "$(id -u):
   -e CC_NODES_FILE="${CC_RUN_DIR}/cc_nodes.txt" -e CC_RUNNER_TOKEN_FILE="${CC_SECRETS_DIR}/runner_token" \
   -e CC_GATEWAY_ADMIN_TOKEN_FILE="${CC_SECRETS_DIR}/gateway_admin_token" \
   -e HIP_SF_URL_FILE -e HIP_SANDBOX_TOKEN_FILE -e CC_SESSION_URLS="${SESSION_URLS}" -e CC_OUT="${OUT}" \
-  -e CC_TASKS="${CC_TASKS}" -e CC_TASK_LIMIT="${CC_TASK_LIMIT:-0}" -e CC_SAMPLES="${CC_SAMPLES:-4}" \
+  -e CC_STEP="${CC_STEP}" -e CC_TASKS="${CC_TASKS}" -e CC_TASK_LIMIT="${CC_TASK_LIMIT:-0}" -e CC_SAMPLES="${CC_SAMPLES:-4}" \
   -e CC_CONCURRENCY="${CC_CONCURRENCY}" -e CC_RESUME="${CC_RESUME:-0}" -e CC_TEMPERATURE="${CC_TEMPERATURE:-1.0}" \
   -e CC_CONTEXT="${CC_CONTEXT}" -e CC_MAX_OUT -e CC_STOP_MARGIN -e CC_MAX_CALLS -e CC_WALL_S \
   -e CC_CHECKS_CORRECTNESS -e CC_CHECKS_PERF -e CC_CHECKS_COUNTERS -e CC_COUNTERS -e CC_HEALTHY_FLOOR \

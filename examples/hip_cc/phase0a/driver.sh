@@ -26,7 +26,7 @@ srun --overlap --jobid "${JOB}" -N1 -n1 -w "${NODE}" \
   -e CC_SESSION_URLS="${SESSION_URLS}" -e SGLANG_URL="${SGLANG_URL}" -e CC_OUT="${STEP_OUT}" -e RUN_DIR="${RUN_DIR}" \
   -e MODEL="${MODEL}" -e CC_CONTEXT="${CC_CONTEXT}" -e CC_MAX_OUT=16384 -e CC_STOP_MARGIN=4096 -e CC_MAX_CALLS=40 \
   -e CC_WALL_S=1200 -e CC_CHECKS_CORRECTNESS=10 -e CC_CHECKS_PERF=4 -e CC_CHECKS_COUNTERS=1 -e CC_COUNTERS=1 \
-  "${EXTRA[@]}" \
+  -e CC_STEP="${CC_STEP:-0a}" "${EXTRA[@]}" \
   -v /home/yuankach:/home/yuankach:ro -v "${OUT}:${OUT}" -v "${RUN_DIR}:${RUN_DIR}" -v "${TASKS_DIR}:${TASKS_DIR}:ro" \
   -v "$(dirname "${HIP_SF_URL_FILE}"):$(dirname "${HIP_SF_URL_FILE}"):ro" -v "${MODEL}:${MODEL}:ro" \
   "${IMAGE}" python3 "${HC}/${SCRIPT}" > "${RUN_DIR}/${NAME}.log" 2>&1

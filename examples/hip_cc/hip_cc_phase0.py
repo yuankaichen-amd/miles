@@ -2,10 +2,12 @@
 
 For each task row and sample it opens a session on the standalone session server v2, runs
 ``hip_cc_agent.Agent.run`` against it, records the session tree summary and the episode result,
-and deletes the session. Rows come from ``$CC_TASKS`` (``t2h_manifest.py workspaces`` output) and must
-all be train tasks: eval128 and heldout150 stay untouched for evaluation.
+and deletes the session. Rows come from ``$CC_TASKS`` (``t2h_manifest.py workspaces`` output). Phase 0a
+runs train tasks only; Phase 0b (``CC_STEP=0b``) also runs the three eval sets for their base-model
+baselines. Reserve tasks are never run.
 
-    CC_TASKS, CC_TASK_LIMIT (0 = all), CC_SAMPLES, CC_CONCURRENCY, CC_SESSION_URLS (comma list,
+    CC_STEP (0a or 0b; default 0a), CC_TASKS, CC_TASK_LIMIT (0 = all), CC_SAMPLES, CC_CONCURRENCY,
+    CC_SESSION_URLS (comma list,
     one session server per rollout node; episodes go round-robin), CC_OUT,
     CC_RESUME (1 = skip finished task/sample pairs), CC_TEMPERATURE, CC_TOP_P
 plus the ``hip_cc_agent`` variables. Results go to ``$CC_OUT/episodes.jsonl``.
@@ -29,12 +31,21 @@ import hip_cc_agent  # noqa: E402
 logger = logging.getLogger("hip_cc_phase0")
 
 
-def load_rows(path: str, limit: int) -> list[dict]:
+PHASE0_SPLITS = {
+    "0a": ("train",),
+    "0b": ("train", "t2h-eval128", "heldout150-t2h", "kernelbench-t2h"),
+}
+
+
+def load_rows(path: str, limit: int, step: str = "0a") -> list[dict]:
+    if step not in PHASE0_SPLITS:
+        raise SystemExit(f"unknown Phase 0 step {step!r}; expected one of {sorted(PHASE0_SPLITS)}")
+    allowed = PHASE0_SPLITS[step]
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     rows = [{**(row.get("label") or {}), **{k: v for k, v in row.items() if k != "label"}} for row in rows]
-    off_split = sorted({str(row.get("split")) for row in rows if row.get("split") != "train"})
+    off_split = sorted({str(row.get("split")) for row in rows if row.get("split") not in allowed})
     if off_split:
-        raise SystemExit(f"Phase 0 samples train tasks only; {path} has splits {off_split}")
+        raise SystemExit(f"Phase {step} samples only {list(allowed)}; {path} has splits {off_split}")
     return rows[:limit] if limit > 0 else rows
 
 
@@ -85,7 +96,7 @@ async def main() -> None:
     out = Path(env["CC_OUT"])
     out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CC_EPISODE_LOG", str(out / "agent_episodes.jsonl"))
-    rows = load_rows(env["CC_TASKS"], int(env.get("CC_TASK_LIMIT", "0")))
+    rows = load_rows(env["CC_TASKS"], int(env.get("CC_TASK_LIMIT", "0")), env.get("CC_STEP", "0a"))
     samples = int(env.get("CC_SAMPLES", "4"))
     sampling = {k: float(env[v]) for k, v in (("temperature", "CC_TEMPERATURE"), ("top_p", "CC_TOP_P")) if v in env}
     results = out / "episodes.jsonl"
