@@ -211,11 +211,13 @@ class TokenSeqComparator:
         """Compare a single aligned segment pair and return a mismatch if they differ.
 
         Special segments are compared by token ID.  Content segments are decoded
-        and compared as stripped text — leading/trailing whitespace (``\\n``,
-        spaces) is ignored because chat templates may insert boundary newlines
-        that differ from the TITO prefix.  This whitespace-only difference does
-        not cause meaningful misalignment with the chat template, so we strip
-        to avoid noisy false positives.
+        and compared as text.  For assistant content, leading/trailing whitespace
+        (``\\n``, spaces) is ignored because chat templates may insert or drop
+        boundary whitespace that differs from the TITO prefix (e.g. a generation
+        cut at max_tokens on a token ending in ``\\n``).  This whitespace-only
+        difference does not cause meaningful misalignment with the chat template,
+        so we strip to avoid noisy false positives.  Non-assistant content must
+        match exactly.
         """
         if exp.is_special:
             if exp.token_ids != act.token_ids:
@@ -227,11 +229,11 @@ class TokenSeqComparator:
                 )
             return None
 
-        # After ignoring assistant text diff, there is no need to keep the strip operator,
-        # as other text should be exact match.
         exp_text = self._decode(exp.token_ids)
         act_text = self._decode(act.token_ids)
         if exp_text == act_text:
+            return None
+        if is_assistant_content and exp_text.strip() == act_text.strip():
             return None
 
         return Mismatch(

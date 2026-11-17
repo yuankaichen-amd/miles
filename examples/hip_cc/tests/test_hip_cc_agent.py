@@ -72,9 +72,46 @@ def test_grade_gives_up_within_15_minutes_and_never_scores_zero():
     grades, sleeps = queue(grader, [0.0])
     body, attempts = run(grades.grade({"episode": "e"}))
     assert body is None
-    assert sum(sleeps.slept) <= 15 * 60
-    assert sleeps.slept == [30, 60, 120, 240]
-    assert len(attempts) == 5
+    assert sum(sleeps.slept) == 15 * 60
+    assert sleeps.slept == [30, 60, 120, 240, 450]
+    assert len(attempts) == 6
+
+
+class OutageGrader:
+    """Infra replies until the clock reaches ``up_at``; each call takes ``call_s``."""
+
+    def __init__(self, clock: list[float], up_at: float, call_s: float = 0.0):
+        self.clock, self.up_at, self.call_s = clock, up_at, call_s
+        self.calls: list[float] = []
+
+    def call(self, method, path, payload=None):
+        self.calls.append(self.clock[0])
+        self.clock[0] += self.call_s
+        if self.calls[-1] >= self.up_at:
+            return Result("ok", 200, GRADE_OK)
+        return Result("infra", 0, error="transport: ConnectionRefusedError")
+
+
+@pytest.mark.parametrize("call_s", [0.0, 5.0])
+def test_grade_retries_cover_the_full_15_minutes(call_s):
+    clock = [0.0]
+    grader = OutageGrader(clock, up_at=14 * 60, call_s=call_s)
+    grades, sleeps = queue(grader, clock)
+    body, attempts = run(grades.grade({"episode": "e"}))
+    assert body["score"] == 0.4
+    assert attempts[-1]["kind"] == "ok"
+    assert 14 * 60 <= grader.calls[-1] <= 15 * 60
+
+
+@pytest.mark.parametrize("call_s", [0.0, 5.0])
+def test_grade_last_attempt_lands_at_the_deadline(call_s):
+    clock = [0.0]
+    grader = OutageGrader(clock, up_at=float("inf"), call_s=call_s)
+    grades, sleeps = queue(grader, clock)
+    body, _ = run(grades.grade({"episode": "e"}))
+    assert body is None
+    assert grader.calls[-1] == pytest.approx(15 * 60)
+    assert sleeps.slept[-1] < 480
 
 
 def test_grade_rejected_is_not_retried():

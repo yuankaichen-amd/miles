@@ -215,10 +215,10 @@ class GradeQueue:
                 return None, attempts
             if attempt == len(self.backoff):
                 break
-            delay = self.backoff[attempt]
-            if self.clock() - start + delay > self.deadline_s:
+            remaining = self.deadline_s - (self.clock() - start)
+            if remaining <= 0:
                 break
-            await self.sleep(delay)
+            await self.sleep(min(self.backoff[attempt], remaining))
         return None, attempts
 
 
