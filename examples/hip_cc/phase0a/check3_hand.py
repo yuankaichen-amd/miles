@@ -78,9 +78,9 @@ def main() -> int:
     matched = [ids_digest(r["request"]["input_ids"]) in engine for r in records if r.get("request", {}).get("input_ids")]
     episode_log = [json.loads(line) for line in (out / "agent_episodes.jsonl").read_text().splitlines()]
     record = episode_log[-1] if episode_log else {}
-    log_dir = Path(record.get("log_dir") or "")
+    log_dir = Path(record["log_dir"]) if record.get("log_dir") else None
     events = [json.loads(line) for line in (log_dir / "events.jsonl").read_text().splitlines()] \
-        if (log_dir / "events.jsonl").is_file() else []
+        if log_dir and (log_dir / "events.jsonl").is_file() else []
     checks = [e for e in events if e.get("event") == "check"]
     report = {
         "task_id": row["task_id"], "result": result, "tree": tree, "records": len(records),
@@ -88,7 +88,7 @@ def main() -> int:
         "engine_requests_logged": sum(engine.values()),
         "checks": [{k: c.get(k) for k in ("action", "kind", "status", "seconds", "charged", "passed", "grader_error")}
                    for c in checks],
-        "grade": record.get("grade"), "dropped": record.get("dropped"), "log_dir": str(log_dir),
+        "grade": record.get("grade"), "dropped": record.get("dropped"), "log_dir": str(log_dir) if log_dir else None,
     }
     report["pass"] = bool(
         tree.get("roots") == 1 and not tree.get("tito_session_mismatch") and matched and all(matched)
