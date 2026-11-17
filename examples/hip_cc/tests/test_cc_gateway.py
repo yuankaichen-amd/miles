@@ -189,8 +189,10 @@ def test_replay_with_harness_notes_keeps_history_consistent(path, tmp_path):
             client = cc_gateway.normalize_request(body)[0]["messages"]
             sent_messages = sent["body"]["messages"]
             assert len(sent_messages) == len(client)
-            if len(client) > 1 and client[-1]["role"] == "user":
-                assert "[harness]" in json.dumps(sent_messages[-1])
+            turn = cc_gateway._turn_index(client)
+            if turn is not None and turn > 0:
+                assert "[harness]" in json.dumps(sent_messages[turn])
+                assert sent_messages[turn + 1:] == client[turn + 1:]
             else:
                 assert sent_messages[-1] == client[-1]
             if previous_client is not None and client[:len(previous_client)] == previous_client:
@@ -475,6 +477,153 @@ def test_cut_reasoning_is_carried_into_a_gateway_retry(tmp_path):
         assert summary["calls"] == 3 and summary["continuations"] == 1
         (cont,) = [e for e in events_of(h, episode) if e["event"] == "continue"]
         assert cont["round"] == 1 and cont["cut_in_reasoning"] and cont["limit"] == 100
+
+    run(go())
+
+
+ENV_UPDATE = {"role": "system", "content": "# Environment update\n - Primary working directory: /workspace"}
+
+
+def test_turn_index_skips_trailing_system_messages():
+    user = {"role": "user", "content": "u"}
+    assistant = {"role": "assistant", "content": "a"}
+    system = {"role": "system", "content": "s"}
+    assert cc_gateway._turn_index([user]) == 0
+    assert cc_gateway._turn_index([user, system]) == 0
+    assert cc_gateway._turn_index([user, assistant, user, system, system]) == 2
+    assert cc_gateway._turn_index([user, assistant]) is None
+    assert cc_gateway._turn_index([user, assistant, system]) is None
+    assert cc_gateway._turn_index([system]) is None and cc_gateway._turn_index([]) is None
+
+
+def test_cut_before_a_trailing_system_message_is_retried_on_the_user_turn(tmp_path):
+    """Claude Code can end a request with a system message; the note and the retry go on the user turn before it,
+    the system message is sent unchanged, and later requests see the same noted turn."""
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=1000, reasoning_cap=100)
+        ls = tool("Bash", {"command": "ls"})
+        write = tool("Write", {"file_path": "/workspace/solution/kernel.hip", "content": "k"})
+        h.mock.replies = [([thinking("plan before env update")], "max_tokens"), ([write], "tool_use")]
+        messages = [{"role": "user", "content": [{"type": "text", "text": "task"}]},
+                    {"role": "assistant", "content": [ls]}, result_for(ls, "files"), ENV_UPDATE]
+        body = simple_body(messages=messages)
+        reply = (await h.call(episode, token, body)).json()
+        assert reply["stop_reason"] == "tool_use" and reply["content"][0]["id"] == write["id"]
+        first, second = (r["body"]["messages"] for r in h.mock.received)
+        assert first[3] == second[3] == ENV_UPDATE
+        assert "model calls left" in first[2]["content"][0]["content"]
+        noted = second[2]["content"][0]["content"]
+        assert noted.startswith("files\n\n[harness] ") and "model calls left" in noted
+        assert noted.endswith("<previous_reasoning>\nplan before env update\n</previous_reasoning>")
+        assert first[:2] == second[:2] == messages[:2]
+
+        body2 = {**body, "messages": messages + [{"role": "assistant", "content": reply["content"]},
+                                                 result_for(write)]}
+        await h.call(episode, token, body2)
+        third = h.mock.received[-1]["body"]["messages"]
+        assert third[:4] == second
+        assert all(r["miles_verdict"] == "ok" for r in h.mock.received)
+        summary = await h.finish(episode)
+        assert summary["calls"] == 3 and summary["continuations"] == 1
+        (cont,) = [e for e in events_of(h, episode) if e["event"] == "continue"]
+        assert cont["position"] == 2
+
+    run(go())
+
+
+def test_first_request_ending_in_system_is_retried_without_a_reminder(tmp_path):
+    """Claude Code's first request is [user, system]: no reminder on the first turn, but a cut is still retried."""
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=1000, reasoning_cap=100)
+        h.mock.replies = [([thinking("first plan")], "max_tokens"), ([tool("Bash", {"command": "ls"})], "tool_use")]
+        messages = [{"role": "user", "content": "task"}, ENV_UPDATE]
+        assert (await h.call(episode, token, simple_body(messages=messages))).json()["stop_reason"] == "tool_use"
+        first, second = (r["body"]["messages"] for r in h.mock.received)
+        assert first == messages
+        assert second[1] == ENV_UPDATE
+        assert "model calls left" not in second[0]["content"]
+        assert second[0]["content"].startswith("task\n\n[harness] Your previous reply hit the 100-token reasoning cap")
+        assert (await h.finish(episode))["continuations"] == 1
+
+    run(go())
+
+
+PROBE_REPLAY_DIR = Path(os.environ.get("PROBE_REPLAY_DIR",
+                                       "/shared_inference/yuankach/glm53/hip-cc/p0a/probe-567011/replay"))
+
+
+def probe_replays() -> list[Path]:
+    return sorted(PROBE_REPLAY_DIR.glob("*.json"))
+
+
+def probe_requests(data: dict) -> list[tuple[dict, dict]]:
+    """The client requests of one probe episode (extract_probe_requests.py), as full Messages bodies."""
+    bodies, messages = [], []
+    for request in data["requests"]:
+        messages = messages[:request["keep"]] + request["delta"]
+        body = {"model": data["model"], "max_tokens": 32000, "stream": request["stream"], "messages": messages}
+        if data.get("system"):
+            body["system"] = data["system"]
+        if data.get("tools"):
+            body["tools"] = data["tools"]
+        bodies.append((request, body))
+    return bodies
+
+
+def test_probe_replays_have_the_trailing_system_requests():
+    """Probe 567011: 13 requests end in a system message, the 5 first requests and 8 mid-episode."""
+    replays = probe_replays()
+    if not replays:
+        pytest.skip(f"no probe replays in {PROBE_REPLAY_DIR}")
+    requests = [r for p in replays for r, _ in probe_requests(json.loads(p.read_text()))]
+    ending = [r for r in requests if r["ends_in_system"]]
+    assert len(replays) == 5 and len(requests) == 147
+    assert len(ending) == 13 and sum(r["call"] > 1 for r in ending) == 8
+    assert not any(r["had_note"] for r in ending)
+
+
+@pytest.mark.parametrize("path", probe_replays(), ids=lambda p: p.stem)
+def test_probe_replay_retries_cuts_on_requests_ending_in_system(path, tmp_path):
+    """Replays a probe episode's client requests; every request that ends in a system message gets a cut-off
+    reply first. The gateway must note and retry on the user turn before the system message(s), send those
+    unchanged, pass Miles validation, and keep later histories extending what it sent before."""
+    data = json.loads(path.read_text())
+
+    async def go():
+        h = Harness(tmp_path)
+        episode, token = await h.register(max_out=16384, context=131072, max_calls=1000, wall_s=10**6)
+        previous_client, previous_sent, expected_continuations = None, None, 0
+        for request, body in probe_requests(data):
+            client = cc_gateway.normalize_request(body)[0]["messages"]
+            turn = cc_gateway._turn_index(client)
+            before = len(h.mock.received)
+            if request["ends_in_system"]:
+                assert turn is not None and client[-1]["role"] == "system"
+                h.mock.replies = [([thinking(f"cut plan {request['call']}")], "max_tokens"),
+                                  ([tool("Bash", {"command": "ls"})], "tool_use")]
+            r = await h.call(episode, token, body)
+            assert r.status_code == 200, r.text
+            assert h.mock.received[-1]["miles_verdict"] == "ok"
+            sent = h.mock.received[-1]["body"]["messages"]
+            assert len(sent) == len(client)
+            if request["ends_in_system"]:
+                expected_continuations += 1
+                assert len(h.mock.received) == before + 2 and not h.mock.replies
+                first = h.mock.received[before]["body"]["messages"]
+                assert first[turn + 1:] == sent[turn + 1:] == client[turn + 1:]
+                assert f"cut plan {request['call']}\n</previous_reasoning>" in cc_gateway._message_text(sent[turn])
+                if turn > 0:
+                    assert "model calls left" in cc_gateway._message_text(first[turn])
+            else:
+                assert len(h.mock.received) == before + 1
+            if previous_client is not None and client[:len(previous_client)] == previous_client:
+                assert sent[:len(previous_sent)] == previous_sent
+            previous_client, previous_sent = client, sent
+        summary = await h.finish(episode)
+        assert summary["rejected"] == 0 and not summary["upstream_errors"]
+        assert summary["continuations"] == expected_continuations > 0
 
     run(go())
 

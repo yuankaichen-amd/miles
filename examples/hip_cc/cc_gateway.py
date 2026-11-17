@@ -432,14 +432,14 @@ class Gateway:
         """The client's history with every recorded harness note re-applied, plus a fresh note on the last user
         turn (recorded for later requests). Only the last user turn's note is recomputed."""
         out = list(client_messages)
-        last = len(out) - 1
-        for index, message in enumerate(out[:last]):
-            if message.get("role") != "user":
+        last = _turn_index(client_messages)
+        for index, message in enumerate(out):
+            if message.get("role") != "user" or index == last:
                 continue
             recorded = episode.notes.get((index, _messages_sha(client_messages[:index])))
             if recorded and recorded["orig"] == _messages_sha([message]):
                 out[index] = _append_note(message, recorded["text"])
-        if last < 0 or out[last].get("role") != "user":
+        if last is None:
             return out, None
         key = (last, _messages_sha(client_messages[:last]))
         parts = []
@@ -569,12 +569,23 @@ def _messages_sha(messages: list) -> str:
     return sha256(json.dumps(messages, sort_keys=True, separators=(",", ":")))
 
 
+def _turn_index(client_messages: list) -> int | None:
+    """Position of the last user turn, skipping trailing system messages (Claude Code appends environment updates
+    and file-change notices as system turns after it); None if the history does not end in a user turn."""
+    index = len(client_messages) - 1
+    while index >= 0 and client_messages[index].get("role") == "system":
+        index -= 1
+    if index < 0 or client_messages[index].get("role") != "user":
+        return None
+    return index
+
+
 def _turn_key(client_messages: list) -> tuple[int, str] | None:
     """Identifies the last user turn by its position and the client history before it."""
-    last = len(client_messages) - 1
-    if last < 0 or client_messages[last].get("role") != "user":
+    index = _turn_index(client_messages)
+    if index is None:
         return None
-    return last, _messages_sha(client_messages[:last])
+    return index, _messages_sha(client_messages[:index])
 
 
 def _append_note(message: dict, note: str) -> dict:
