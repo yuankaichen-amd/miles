@@ -296,6 +296,33 @@ def test_resource_remarks_parse_and_report():
     assert aka_eval.resource_report([]).startswith("resources: no device kernels")
 
 
+def test_compile_requests_the_clang17_abi(tmp_path, monkeypatch):
+    """`aka-eval compile` passes -fclang-abi-compat=17 to hipcc (extra_cuda_cflags), so const_data_ptr<T>() links
+    against libtorch's export."""
+    import subprocess
+    import types
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="error: stop here\n")
+
+    audit = types.ModuleType("aka_audit")
+    audit.PolicyError = type("PolicyError", (Exception,), {})
+    audit.audit_hip_sources = lambda sources, name: None
+    monkeypatch.setitem(sys.modules, "aka_audit", audit)
+    monkeypatch.setattr(aka_eval, "BUILD_ROOT", tmp_path)
+    monkeypatch.setattr(aka_eval.subprocess, "run", fake_run)
+    ok, text = aka_eval.compile_candidate("// kernel")
+    assert not ok and text.startswith("compile: FAIL")
+    (argv,) = calls
+    assert argv[1:3] == ["-c", aka_eval.BUILD_SCRIPT]
+    cflags = argv[6:]
+    assert "-fclang-abi-compat=17" in cflags and "-O3" in cflags and aka_eval.REMARK_FLAG in cflags
+    assert "extra_cuda_cflags=sys.argv[4:]" in aka_eval.BUILD_SCRIPT
+
+
 def test_stream_metrics():
     stream = "\n".join([
         json.dumps({"type": "system", "subtype": "init"}),

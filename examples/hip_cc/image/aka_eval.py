@@ -31,7 +31,9 @@ EVAL_URL = os.environ.get("CC_EVAL_URL", "http://127.0.0.1:8081")
 TOKEN_FILE = Path(os.environ.get("CC_EVAL_TOKEN_FILE", "/home/agent/.cc/eval_token"))
 BUILD_ROOT = Path(os.environ.get("CC_BUILD_ROOT", "/tmp/aka-build"))
 ARCH = "gfx950"
-FLAGS = ("-O3",)
+# hipcc's Clang 18+ mangles at::TensorBase::const_data_ptr<T>() differently from libtorch's (Clang 17) export, so
+# kernels calling it build but fail to load with an undefined symbol unless the old ABI is requested.
+FLAGS = ("-O3", "-fclang-abi-compat=17")
 REMARK_FLAG = "-Rpass-analysis=kernel-resource-usage"
 LDS_BYTES = 163840
 LDS_GRANULE = 1280
