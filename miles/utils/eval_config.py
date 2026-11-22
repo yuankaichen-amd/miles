@@ -118,6 +118,10 @@ class EvalDatasetConfig:
     # per-dataset custom generate function (e.g., for tool calling)
     custom_generate_function_path: str | None = None
 
+    # Run this dataset only at eval points where (rollout_id + 1) % interval == 0, and at the last
+    # rollout. None runs it at every eval point.
+    interval: int | None = None
+
     metadata_overrides: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

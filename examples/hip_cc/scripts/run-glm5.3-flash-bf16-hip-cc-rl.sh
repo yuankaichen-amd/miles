@@ -53,8 +53,11 @@ fi
 case "${TRAIN_NODES}" in
   4) PP_ARGS=(--pipeline-model-parallel-size 4 --decoder-first-pipeline-num-layers 12 --decoder-last-pipeline-num-layers 11) ;;
   # 5 + 6x6 + 4 layers; the last stage also holds the LM head.
-  8) PP_ARGS=(--pipeline-model-parallel-size 8 --decoder-first-pipeline-num-layers 5 --decoder-last-pipeline-num-layers 4) ;;
-  *) echo "HIP RL expects TRAIN_NODES=4 or 8" >&2; exit 1 ;;
+  # 8 nodes: one PP stage per node. 16 nodes: the same 8 stages with data parallel 2.
+  8|16) PP_ARGS=(--pipeline-model-parallel-size 8 --decoder-first-pipeline-num-layers 5 --decoder-last-pipeline-num-layers 4) ;;
+  # 12 nodes: PP=12 x CP=8 = 96 GPUs at data parallel 1 (PP=8 x CP=8 does not divide 96); 3 + 4x10 + 2 layers.
+  12) PP_ARGS=(--pipeline-model-parallel-size 12 --decoder-first-pipeline-num-layers 3 --decoder-last-pipeline-num-layers 2) ;;
+  *) echo "HIP RL expects TRAIN_NODES=4, 8, 12 or 16" >&2; exit 1 ;;
 esac
 
 cd "${MILES_DIR}"
@@ -62,6 +65,15 @@ cd "${MILES_DIR}"
 DATA_ORDER_ARGS=()
 [ "${ROLLOUT_SHUFFLE:-1}" = 1 ] && DATA_ORDER_ARGS+=(--rollout-shuffle)
 [ "${SKIP_EVAL_BEFORE_TRAIN:-1}" = 1 ] && DATA_ORDER_ARGS+=(--skip-eval-before-train)
+EVAL_ARGS=(--eval-input-key prompt --eval-label-key label --eval-temperature "${EVAL_TEMPERATURE:-1.0}"
+  --eval-max-response-len "${RESPONSE_LEN}" --custom-eval-rollout-log-function-path hip_cc_agent.log_eval_metrics)
+if [ -n "${EVAL_CONFIG:-}" ]; then
+  EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+else
+  EVAL_ARGS+=(--eval-prompt-data t2h-eval128 "${HIP_VAL}" --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-1}")
+fi
+FILTER_ARGS=()
+[ -n "${DYNAMIC_FILTER:-}" ] && FILTER_ARGS+=(--dynamic-sampling-filter-path "${DYNAMIC_FILTER}")
 RADIX_ARGS=()
 [ "${SGLANG_RADIX_CACHE:-0}" = 1 ] || RADIX_ARGS+=(--sglang-disable-radix-cache)
 
@@ -142,12 +154,8 @@ ray job submit --address="http://127.0.0.1:8265" \
   --rollout-max-context-len "${SGLANG_CONTEXT_LEN}" \
   --rollout-temperature 1.0 \
   --eval-interval "${EVAL_INTERVAL:-100000}" \
-  --eval-prompt-data t2h-eval128 "${HIP_VAL}" \
-  --eval-input-key prompt \
-  --eval-label-key label \
-  --n-samples-per-eval-prompt 1 \
-  --eval-max-response-len "${RESPONSE_LEN}" \
-  --eval-top-k 1 \
+  "${EVAL_ARGS[@]}" \
+  "${FILTER_ARGS[@]}" \
   --fully-async \
   --async-max-concurrent-samples "${ASYNC_MAX_CONCURRENT_SAMPLES:-128}" \
   --rollout-submission-granularity group \

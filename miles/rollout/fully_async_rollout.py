@@ -105,13 +105,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
-            results = await run_eval_datasets(input.generate_state, self._eval_prompt_dataset_cache)
+            results = await run_eval_datasets(input.generate_state, self._eval_prompt_dataset_cache, input.rollout_id)
             return RolloutFnEvalOutput(data=results)
 
         logger.info("Pausing fully-async producer submissions for shared-engine eval")
         self._producer_resumed.clear()
         try:
-            results = await run_eval_datasets(self.state, self._eval_prompt_dataset_cache)
+            results = await run_eval_datasets(self.state, self._eval_prompt_dataset_cache, input.rollout_id)
         finally:
             self._producer_resumed.set()
             logger.info("Resumed fully-async producer submissions after eval")

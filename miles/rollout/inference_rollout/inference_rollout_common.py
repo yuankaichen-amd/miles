@@ -232,5 +232,5 @@ class InferenceRolloutFn(BaseRolloutFn):
         from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 
         state = input.generate_state or self.state
-        results = await run_eval_datasets(state, self.eval_prompt_dataset_cache)
+        results = await run_eval_datasets(state, self.eval_prompt_dataset_cache, input.rollout_id)
         return RolloutFnEvalOutput(data=results)

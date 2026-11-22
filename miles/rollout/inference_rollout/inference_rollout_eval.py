@@ -21,15 +21,27 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def dataset_due(dataset_cfg: EvalDatasetConfig, rollout_id: int | None, num_rollout: int | None) -> bool:
+    if dataset_cfg.interval is None or rollout_id is None:
+        return True
+    if num_rollout is not None and rollout_id == num_rollout - 1:
+        return True
+    return (rollout_id + 1) % dataset_cfg.interval == 0
+
+
 async def run_eval_datasets(
     state: GenerateState,
     prompt_dataset_cache: dict[Any, Dataset],
+    rollout_id: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     args = state.args
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
     coros = []
     for dataset_cfg in args.eval_datasets:
+        if not dataset_due(dataset_cfg, rollout_id, getattr(args, "num_rollout", None)):
+            logger.info(f"eval {rollout_id}: skipping {dataset_cfg.name} (interval {dataset_cfg.interval})")
+            continue
         coros.append(eval_rollout_single_dataset(state, dataset_cfg, prompt_dataset_cache))
     results_list = await asyncio.gather(*coros)
     return {k: v for r in results_list for k, v in r.items()}

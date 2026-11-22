@@ -60,7 +60,9 @@ export HEAD_IP=$(host_ip "${ALL_NODES[0]}")
 RUN_LOG_DIR=${SHARED_ROOT}/logs/hip-cc-rl-${SLURM_JOB_ID}
 export CC_RUN_DIR=${RUN_LOG_DIR}/cc
 mkdir -p "${RUN_LOG_DIR}" "${CC_RUN_DIR}"
+# A preempted job requeues under the same ID: drop the previous allocation's node list.
 : > "${CC_RUN_DIR}/cc_nodes.txt"
+rm -rf "${CC_RUN_DIR}/cc_nodes.d"
 export HIP_SF_URL_FILE=${HIP_SF_URL_FILE:-${SHARED_ROOT}/hip-cc/crusoe_relay_url.txt}
 export HIP_SANDBOX_TOKEN_FILE=${HIP_SANDBOX_TOKEN_FILE:-${HOME}/.hip_cc/crusoe_grader_token}
 CC_TRAINER=${CC_CONTAINERS_TRAINER:-8}
@@ -132,12 +134,14 @@ for _ in $(seq 1 60); do
 done
 
 echo "waiting for ${RAY_NODES} cc nodes"
+cc_up() { find "${CC_RUN_DIR}/cc_nodes.d" -type f 2>/dev/null | wc -l; }
 for _ in $(seq 1 180); do
-  [ "$(wc -l < "${CC_RUN_DIR}/cc_nodes.txt")" -ge "${RAY_NODES}" ] && break
+  [ "$(cc_up)" -ge "${RAY_NODES}" ] && break
   if ! kill -0 "${CC_PID}" 2>/dev/null; then echo "cc_node step died"; tail -80 "${CC_RUN_DIR}/cc_node.log"; exit 1; fi
   sleep 5
 done
-[ "$(wc -l < "${CC_RUN_DIR}/cc_nodes.txt")" -ge "${RAY_NODES}" ] || { echo "cc nodes not up"; tail -80 "${CC_RUN_DIR}/cc_node.log"; exit 1; }
+[ "$(cc_up)" -ge "${RAY_NODES}" ] || { echo "cc nodes not up"; tail -80 "${CC_RUN_DIR}/cc_node.log"; exit 1; }
+cat "${CC_RUN_DIR}"/cc_nodes.d/* > "${CC_RUN_DIR}/cc_nodes.txt.tmp" && mv "${CC_RUN_DIR}/cc_nodes.txt.tmp" "${CC_RUN_DIR}/cc_nodes.txt"
 cat "${CC_RUN_DIR}/cc_nodes.txt"
 
 NET_ENV="export NCCL_SOCKET_IFNAME=${SOCKET_IFNAME} GLOO_SOCKET_IFNAME=${SOCKET_IFNAME} TP_SOCKET_IFNAME=${SOCKET_IFNAME};"
@@ -163,6 +167,7 @@ fi
 rm -f "${CKPT_DIR}/SAVE_NOW" "${CKPT_DIR}/CHUNK_STOPPED"
 
 export PYTHONPATH="${SNAP}${PYTHONPATH:+:${PYTHONPATH}}"
+[ -f "${RUN_LOG_DIR}/train.log" ] && mv "${RUN_LOG_DIR}/train.log" "${RUN_LOG_DIR}/train.log.$(date +%s)"
 
 docker exec "${CNAME}" bash -c "
   ${NET_ENV}
@@ -178,7 +183,9 @@ docker exec "${CNAME}" bash -c "
   export CC_CONTEXT=${CC_CONTEXT:-131072} CC_MAX_OUT=${CC_MAX_OUT:-16384} CC_STOP_MARGIN=${CC_STOP_MARGIN:-4096}
   export CC_MAX_CALLS=${CC_MAX_CALLS:-40} CC_WALL_S=${CC_WALL_S:-1200} CC_HEALTHY_FLOOR=${CC_HEALTHY_FLOOR:-8}
   export CC_CHECKS_CORRECTNESS=${CC_CHECKS_CORRECTNESS:-10} CC_CHECKS_PERF=${CC_CHECKS_PERF:-4} CC_CHECKS_COUNTERS=${CC_CHECKS_COUNTERS:-1}
-  export CC_EPISODE_LOG=${RUN_LOG_DIR}/episodes.jsonl
+  export CC_COUNTERS=${CC_COUNTERS:-0} CC_KB=${CC_KB:-1}
+  export CC_EPISODE_LOG=${RUN_LOG_DIR}/episodes.jsonl CC_EVAL_LOG=${RUN_LOG_DIR}/eval.jsonl
+  export DYNAMIC_FILTER=${DYNAMIC_FILTER:-} EVAL_CONFIG=${EVAL_CONFIG:-} N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-1}
   export SGLANG_RADIX_CACHE=${SGLANG_RADIX_CACHE:-1}
   export HIP_TRAIN=${HIP_TRAIN} HIP_VAL=${HIP_VAL}
   export SGLANG_PROFILE=${SGLANG_PROFILE:-rocm}
@@ -220,6 +227,13 @@ kill ${SAVER_PID} 2>/dev/null || true
 echo "RUN FINISHED rc=${rc} $(date -u)"
 if [ -f "${CKPT_DIR}/CHUNK_STOPPED" ]; then
   echo "chunk stopped after a time-limit save; the next job resumes from $(cat "${LATEST}")"
+  # CC_RESUBMIT: a script that sbatches the next chunk with this run's exports (CC_AFTER is this job).
+  if [ -n "${CC_RESUBMIT:-}" ] && [ ! -f "${CKPT_DIR}/NO_RESUBMIT" ]; then
+    CC_AFTER=${SLURM_JOB_ID} bash "${CC_RESUBMIT}" && echo "next chunk submitted" || echo "resubmit failed"
+  fi
   exit 0
+fi
+if [ "${rc}" = 0 ] && grep -q "Job 'raysubmit_[A-Za-z0-9]*' succeeded" "${RUN_LOG_DIR}/train.log"; then
+  touch "${CKPT_DIR}/DONE"
 fi
 exit ${rc}

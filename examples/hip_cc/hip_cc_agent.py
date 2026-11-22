@@ -348,7 +348,10 @@ class Agent:
         token = secrets.token_urlsafe(32)
         spec = self.episode_spec(episode, token, label)
         record: dict[str, Any] = {"episode": episode, "task_id": label["task_id"], "split": spec["split"],
-                                  "breaker_wait_s": waited}
+                                  "breaker_wait_s": waited, "started": round(started, 1)}
+        for key in ("hip_cc_group", "hip_cc_eval"):
+            if key in label:
+                record[key.removeprefix("hip_cc_")] = label[key]
         node = None
         result: dict | None = None
         gateway: dict = {}
@@ -467,7 +470,8 @@ async def generate(fn_input):
     from miles.utils.types import Sample
 
     sample = fn_input.sample
-    sample.metadata = {**_as_dict(getattr(sample, "label", None)), **_as_dict(getattr(sample, "metadata", None))}
+    sample.metadata = {**_as_dict(getattr(sample, "label", None)), **_as_dict(getattr(sample, "metadata", None)),
+                       "hip_cc_group": sample.group_index, "hip_cc_eval": bool(fn_input.evaluation)}
     output = await agentic_generate(fn_input)
     samples = output.samples if isinstance(output.samples, list) else [output.samples]
     for s in samples:
@@ -489,18 +493,23 @@ generate.add_arguments = _add_arguments
 def log_rollout_metrics(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> bool:
     """Print per-step episode stats; Miles' default logging still runs."""
     episodes: dict[str, dict] = {}
+    rewards_by_episode: dict[str, float] = {}
     for s in samples:
         meta = s.metadata or {}
         if "hip_cc_episode" in meta:
             episodes.setdefault(meta["hip_cc_episode"], meta)
+            if isinstance(s.reward, (int, float)):
+                rewards_by_episode.setdefault(meta["hip_cc_episode"], float(s.reward))
     if episodes:
         metas = list(episodes.values())
         stops: dict[str, int] = {}
         for m in metas:
             stops[str(m.get("hip_cc_stop"))] = stops.get(str(m.get("hip_cc_stop")), 0) + 1
         n = len(metas)
+        rewards = list(rewards_by_episode.values())
         stats = {
             "episodes": n,
+            "episode_reward_mean": round(sum(rewards) / len(rewards), 4) if rewards else None,
             "samples_per_episode": round(len(samples) / n, 2),
             "compiled": sum(bool(m.get("hip_cc_compiled")) for m in metas) / n,
             "correct": sum(bool(m.get("hip_cc_correct")) for m in metas) / n,
@@ -511,6 +520,49 @@ def log_rollout_metrics(rollout_id, args, samples, rollout_extra_metrics, rollou
             stats.update({"dropped_total": _AGENT.dropped, "breaker_trips": _AGENT.breaker.trips,
                           "breaker_open": _AGENT.breaker.open})
         print(f"hip_cc {rollout_id}: {json.dumps(stats)}", flush=True)
+    return False
+
+
+def summarize_eval(data: dict) -> dict[str, dict]:
+    """Per eval set, one row per episode (an episode can have several kept samples); dropped episodes
+    are counted but left out of the means, as in the Phase 0 baselines."""
+    out = {}
+    for name, entry in data.items():
+        episodes: dict[str, dict] = {}
+        aborted_without_episode = set()
+        for s in entry.get("samples") or []:
+            meta = s.metadata or {}
+            key = meta.get("hip_cc_episode")
+            if key is None:
+                aborted_without_episode.add(s.index)
+                continue
+            row = episodes.setdefault(key, {"reward": None, "dropped": bool(meta.get("hip_cc_dropped")),
+                                            "correct": bool(meta.get("hip_cc_correct")),
+                                            "compiled": bool(meta.get("hip_cc_compiled"))})
+            if not row["dropped"] and isinstance(s.reward, (int, float)):
+                row["reward"] = float(s.reward)
+        graded = [r for r in episodes.values() if not r["dropped"] and r["reward"] is not None]
+        n = len(graded)
+        out[name] = {
+            "episodes": len(episodes) + len(aborted_without_episode),
+            "graded": n,
+            "dropped": len(episodes) + len(aborted_without_episode) - n,
+            "mean_reward": round(sum(r["reward"] for r in graded) / n, 4) if n else None,
+            "correct": round(sum(r["correct"] for r in graded) / n, 4) if n else None,
+            "reward_gt0": round(sum(r["reward"] > 0 for r in graded) / n, 4) if n else None,
+        }
+    return out
+
+
+def log_eval_metrics(rollout_id, args, data, extra_metrics) -> bool:
+    """--custom-eval-rollout-log-function-path: episode-level eval summary to CC_EVAL_LOG; Miles' default
+    eval logging still runs."""
+    summary = summarize_eval(data)
+    record = {"rollout_id": rollout_id, "time": round(time.time(), 1), "sets": summary}
+    print(f"hip_cc eval {rollout_id}: {json.dumps(summary)}", flush=True)
+    if path := os.environ.get("CC_EVAL_LOG"):
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
     return False
 
 

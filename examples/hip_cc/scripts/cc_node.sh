@@ -138,5 +138,8 @@ EOF
 done
 [ "$gw" = 200 ] && [ "$rn" = 200 ] || { log "gateway $gw runner $rn not healthy"; docker logs --tail 20 "$GW_NAME"; exit 1; }
 echo "http://$NODE_IP:$RUNNER_PORT http://$NODE_IP:$GW_PORT" >> "$CC_RUN_DIR/cc_nodes.txt"
+# Concurrent NFS appends to cc_nodes.txt can lose lines; one file per host can't.
+mkdir -p "$CC_RUN_DIR/cc_nodes.d"
+echo "http://$NODE_IP:$RUNNER_PORT http://$NODE_IP:$GW_PORT" > "$CC_RUN_DIR/cc_nodes.d/$HOST"
 log "up: runner :$RUNNER_PORT (capacity $CAP) gateway :$GW_PORT image $IMAGE_ID"
 wait "$RUNNER_PID"
