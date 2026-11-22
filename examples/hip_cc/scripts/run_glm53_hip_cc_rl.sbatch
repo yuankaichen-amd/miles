@@ -179,6 +179,13 @@ fi
 rm -f "${CKPT_DIR}/SAVE_NOW" "${CKPT_DIR}/CHUNK_STOPPED"
 
 export PYTHONPATH="${SNAP}${PYTHONPATH:+:${PYTHONPATH}}"
+# Cold Triton caches cost ~30 min of FLA autotune/compile in the first train step: copy a shared seed
+# into each node's local cache (no overwrite) before training starts.
+if [ -n "${CC_TRITON_SEED:-}" ] && [ -d "${CC_TRITON_SEED}" ]; then
+  srun --overlap --nodes="${RAY_NODES}" --ntasks="${RAY_NODES}" --ntasks-per-node=1 -w "${RAY_LIST}" \
+    bash -c "mkdir -p ${TRITON_CACHE_DIR} && cp -rn ${CC_TRITON_SEED}/. ${TRITON_CACHE_DIR}/" \
+    && echo "triton cache seeded from ${CC_TRITON_SEED}" || echo "triton cache seed failed (continuing)"
+fi
 [ -f "${RUN_LOG_DIR}/train.log" ] && mv "${RUN_LOG_DIR}/train.log" "${RUN_LOG_DIR}/train.log.$(date +%s)"
 
 docker exec "${CNAME}" bash -c "
