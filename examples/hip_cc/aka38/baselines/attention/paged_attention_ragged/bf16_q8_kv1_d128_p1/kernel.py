@@ -31,5 +31,7 @@ def run(*, query, key_cache, value_cache, kv_indptr, kv_indices, scale, max_cont
     for p0 in range(0, total, _CHUNK_TOKENS):
         part = slice(p0, p0 + _CHUNK_TOKENS)
         v = value_cache[slots[part]].float().unsqueeze(2)
-        numer.index_add_(0, seq[part], probs[part].unsqueeze(-1) * v)
+        # Buffer entries past kv_indptr[-1] point at unused (NaN) slots, and 0 * NaN is NaN.
+        contribution = torch.where(valid[part, None, None, None], probs[part].unsqueeze(-1) * v, 0.0)
+        numer.index_add_(0, seq[part], contribution)
     out.copy_((numer / denom.unsqueeze(-1)).view(num_seqs, num_query_heads, head_size))
