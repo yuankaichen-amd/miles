@@ -29,7 +29,7 @@ spec = importlib.util.spec_from_file_location("baseline_kernel", "baseline/kerne
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 run = mod.run
 contract = load_contract()
-dev = torch.device("cuda")
+dev = torch.device("cuda", 0)
 report = {"cases": []}
 max_cases = int(sys.argv[1])
 

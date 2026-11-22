@@ -118,6 +118,9 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist()
 
         self._last_rollout_id: int | None = None
+        # HIP scratch and RCCL buffers live outside the caching allocator; a cap keeps room for them.
+        if fraction := os.environ.get("MILES_CUDA_MEMORY_FRACTION"):
+            torch.cuda.set_per_process_memory_fraction(float(fraction))
         super()._init_common(args, role, with_ref, with_opd_teacher=with_opd_teacher)
 
         for m in all_replay_managers:
@@ -558,8 +561,9 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
+        print_memory(f"before {store_prefix}log_probs")
         with timer(f"{store_prefix}log_probs"):
-            return forward_only(
+            result = forward_only(
                 get_log_probs_and_entropy,
                 self.args,
                 self.model,
@@ -570,6 +574,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 fp32_output=False,
                 use_rollout_sampling_mask=store_prefix == "" and self.args.use_sampling_support_replay,
             )
+        print_memory(f"after {store_prefix}log_probs")
+        return result
 
     @with_logs
     @event_logger_context(
