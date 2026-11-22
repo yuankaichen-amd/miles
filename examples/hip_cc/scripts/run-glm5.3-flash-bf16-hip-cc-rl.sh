@@ -102,6 +102,9 @@ import json, os
 env = {}
 if os.environ.get("TRAIN_PYTORCH_ALLOC_CONF"):
     env["PYTORCH_ALLOC_CONF"] = os.environ["TRAIN_PYTORCH_ALLOC_CONF"]
+# The rollout engines keep HSA_NO_SCRATCH_RECLAIM=1; trainers can override it (0 = let ROCr reclaim scratch).
+if os.environ.get("TRAIN_HSA_NO_SCRATCH_RECLAIM"):
+    env["HSA_NO_SCRATCH_RECLAIM"] = os.environ["TRAIN_HSA_NO_SCRATCH_RECLAIM"]
 if os.environ.get("TURBO_PYTHONPATH"):
     env["PYTHONPATH"] = os.environ["TURBO_PYTHONPATH"] + ":" + os.environ["PYTHONPATH"]
 for key in ("K3P_KDA_CONV", "PRIMUS_DSA_DKV_SAFE", "PRIMUS_DSA_BWD_BLOCK_H", "PRIMUS_DSA_BWD_NUM_STAGES"):

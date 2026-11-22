@@ -59,7 +59,7 @@ export HEAD_IP=$(host_ip "${ALL_NODES[0]}")
 
 RUN_LOG_DIR=${SHARED_ROOT}/logs/hip-cc-rl-${SLURM_JOB_ID}
 export CC_RUN_DIR=${RUN_LOG_DIR}/cc
-mkdir -p "${RUN_LOG_DIR}" "${CC_RUN_DIR}"
+mkdir -p "${RUN_LOG_DIR}" "${CC_RUN_DIR}" "${RUN_LOG_DIR}/memory"
 # A preempted job requeues under the same ID: drop the previous allocation's node list.
 : > "${CC_RUN_DIR}/cc_nodes.txt"
 rm -rf "${CC_RUN_DIR}/cc_nodes.d"
@@ -205,6 +205,8 @@ docker exec "${CNAME}" bash -c "
   export CC_COUNTERS=${CC_COUNTERS:-0} CC_KB=${CC_KB:-1}
   export CC_EPISODE_LOG=${RUN_LOG_DIR}/episodes.jsonl CC_EVAL_LOG=${RUN_LOG_DIR}/eval.jsonl
   export DYNAMIC_FILTER=${DYNAMIC_FILTER:-} EVAL_CONFIG=${EVAL_CONFIG:-} N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-1}
+  export TRAIN_PYTORCH_ALLOC_CONF=${TRAIN_PYTORCH_ALLOC_CONF:-} TRAIN_HSA_NO_SCRATCH_RECLAIM=${TRAIN_HSA_NO_SCRATCH_RECLAIM:-}
+  export MILES_MEMORY_LOG_DIR=${RUN_LOG_DIR}/memory
   export SGLANG_RADIX_CACHE=${SGLANG_RADIX_CACHE:-1}
   export HIP_TRAIN=${HIP_TRAIN} HIP_VAL=${HIP_VAL}
   export SGLANG_PROFILE=${SGLANG_PROFILE:-rocm}
