@@ -95,8 +95,20 @@ cleanup() {
   shred -u "${CC_SECRETS_DIR}"/* 2>/dev/null || true
   rmdir "${CC_SECRETS_DIR}" 2>/dev/null || true
 }
+# CC_RESUBMIT: a script that sbatches the next chunk with this run's exports (CC_AFTER is this job).
+# Runs once per job attempt, at a chunk stop or on the time-limit signal; never on TERM (preemption
+# requeues this job under the same ID, and scancel must not chain).
+resubmit_next() {
+  local d=${SHARED_ROOT}/ckpt/${RUN_NAME:-glm53-hip-cc}
+  local mark=${d}/RESUBMITTED_${SLURM_JOB_ID}_${SLURM_RESTART_COUNT:-0}
+  [ -n "${CC_RESUBMIT:-}" ] || return 0
+  [ -f "${d}/DONE" ] || [ -f "${d}/NO_RESUBMIT" ] || [ -f "${mark}" ] && return 0
+  touch "${mark}"
+  CC_AFTER=${SLURM_JOB_ID} bash "${CC_RESUBMIT}" && echo "next chunk submitted" || echo "resubmit failed"
+}
 trap cleanup EXIT
-trap 'echo "caught signal"; exit 1' USR1 TERM
+trap 'echo "caught time-limit signal"; resubmit_next; exit 1' USR1
+trap 'echo "caught TERM"; exit 1' TERM
 
 # Every node must reproduce the published image ID before any container starts on any node.
 srun --nodes="${RAY_NODES}" --ntasks="${RAY_NODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 -w "${RAY_LIST}" \
@@ -227,10 +239,7 @@ kill ${SAVER_PID} 2>/dev/null || true
 echo "RUN FINISHED rc=${rc} $(date -u)"
 if [ -f "${CKPT_DIR}/CHUNK_STOPPED" ]; then
   echo "chunk stopped after a time-limit save; the next job resumes from $(cat "${LATEST}")"
-  # CC_RESUBMIT: a script that sbatches the next chunk with this run's exports (CC_AFTER is this job).
-  if [ -n "${CC_RESUBMIT:-}" ] && [ ! -f "${CKPT_DIR}/NO_RESUBMIT" ]; then
-    CC_AFTER=${SLURM_JOB_ID} bash "${CC_RESUBMIT}" && echo "next chunk submitted" || echo "resubmit failed"
-  fi
+  resubmit_next
   exit 0
 fi
 if [ "${rc}" = 0 ] && grep -q "Job 'raysubmit_[A-Za-z0-9]*' succeeded" "${RUN_LOG_DIR}/train.log"; then
