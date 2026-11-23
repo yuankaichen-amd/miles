@@ -562,16 +562,20 @@ def run_forward_backward_pass(
 def _record_memory_after_first_backward():
     """Per-rank memory record once per step, right after the first microbatch backward.
 
-    Megatron's pipeline schedules resolve ``backward_step`` from their module globals per call.
+    Megatron's pipeline schedules resolve ``backward_step`` from their module globals at entry.
     """
     from megatron.core.pipeline_parallel import schedules
 
     original = schedules.backward_step
+    recorded = False
 
+    # The schedule binds backward_step to a local at entry, so restoring the global does not unhook it.
     def backward_step(*args, **kwargs):
+        nonlocal recorded
         result = original(*args, **kwargs)
-        schedules.backward_step = original
-        print_memory("after first microbatch backward")
+        if not recorded:
+            recorded = True
+            print_memory("after first microbatch backward")
         return result
 
     schedules.backward_step = backward_step
