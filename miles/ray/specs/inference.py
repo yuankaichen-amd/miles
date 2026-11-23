@@ -416,5 +416,8 @@ def compute_inference_engine_env_vars(args) -> dict[str, str]:
         env_vars.update(dumper_utils.get_sglang_env(args))
     # MILES_ROLLOUT_ENV_<NAME>=v sets <NAME>=v for the engines only; trainers share the Ray runtime env.
     prefix = "MILES_ROLLOUT_ENV_"
-    env_vars.update({k[len(prefix) :]: v for k, v in os.environ.items() if k.startswith(prefix) and len(k) > len(prefix) and v})
+    rollout_only = {k[len(prefix) :]: v for k, v in os.environ.items() if k.startswith(prefix) and len(k) > len(prefix) and v}
+    if rollout_only:
+        logger.info(f"inference engine env overrides: {rollout_only}")
+        env_vars.update(rollout_only)
     return env_vars

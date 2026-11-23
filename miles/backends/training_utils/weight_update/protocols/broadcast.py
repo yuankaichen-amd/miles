@@ -1,3 +1,4 @@
+import os
 import socket
 from argparse import Namespace
 from collections.abc import Sequence
@@ -28,6 +29,10 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
 
     def __init__(self, args: Namespace) -> None:
         super().__init__(args)
+        # One engine group fed by global rank 0 instead of one per PP stage; every engine GPU
+        # otherwise joins pp_size groups of (1 + all engine GPUs) ranks.
+        if os.environ.get("MILES_WEIGHT_UPDATE_GATHER_PP") == "1":
+            self.required_placement = WeightUpdatePlacement(gather_pp=True)
         self._model_update_groups = None
         parallel_state = get_parallel_state()
         self._engine_lock: AbstractContextManager = (
