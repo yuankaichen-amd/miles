@@ -561,6 +561,8 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
+        if os.environ.get("MILES_CLEAR_MEMORY_PER_PHASE") == "1":
+            clear_memory()
         print_memory(f"before {store_prefix}log_probs")
         with timer(f"{store_prefix}log_probs"):
             result = forward_only(
@@ -771,6 +773,10 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             num_rollouts = get_num_rollouts(self.args, rollout_data, num_optimizer_steps)
             self._set_replay_stage("replay_backward")
+            # Not colocated, so nothing else empties the cache; RCCL kernels need device memory outside it.
+            if os.environ.get("MILES_CLEAR_MEMORY_PER_PHASE") == "1":
+                clear_memory()
+                print_memory("before actor_train")
             with timer("actor_train"):
                 train_step_outcome = train(
                     rollout_id,
