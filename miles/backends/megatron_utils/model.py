@@ -4,9 +4,10 @@ import dataclasses
 import gc
 import logging
 import math
+import os
 from argparse import Namespace
 from collections.abc import Callable, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -35,7 +36,7 @@ from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
 from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
 from miles.utils.lora.utils import is_multi_lora_enabled
-from miles.utils.memory_utils import clear_memory
+from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.tracking_utils.structured_log import log_structured
 
@@ -540,7 +541,11 @@ def run_forward_backward_pass(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
-    with torch.no_grad() if forward_only else nullcontext():
+    record_first_backward = not forward_only and os.environ.get("MILES_MEMORY_AFTER_FIRST_BACKWARD") == "1"
+    with (
+        torch.no_grad() if forward_only else nullcontext(),
+        _record_memory_after_first_backward() if record_first_backward else nullcontext(),
+    ):
         return forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -551,6 +556,29 @@ def run_forward_backward_pass(
             decoder_seq_length=args.decoder_seq_length,
             forward_only=forward_only,
         )
+
+
+@contextmanager
+def _record_memory_after_first_backward():
+    """Per-rank memory record once per step, right after the first microbatch backward.
+
+    Megatron's pipeline schedules resolve ``backward_step`` from their module globals per call.
+    """
+    from megatron.core.pipeline_parallel import schedules
+
+    original = schedules.backward_step
+
+    def backward_step(*args, **kwargs):
+        result = original(*args, **kwargs)
+        schedules.backward_step = original
+        print_memory("after first microbatch backward")
+        return result
+
+    schedules.backward_step = backward_step
+    try:
+        yield
+    finally:
+        schedules.backward_step = original
 
 
 def train_one_step(
