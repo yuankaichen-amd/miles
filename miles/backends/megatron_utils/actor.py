@@ -121,6 +121,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # HIP scratch and RCCL buffers live outside the caching allocator; a cap keeps room for them.
         if fraction := os.environ.get("MILES_CUDA_MEMORY_FRACTION"):
             torch.cuda.set_per_process_memory_fraction(float(fraction))
+        dsa_env = {k: v for k, v in os.environ.items() if k.startswith("PRIMUS_DSA_")}
+        logger.info(f"trainer env PRIMUS_DSA_*: {dsa_env}")
         super()._init_common(args, role, with_ref, with_opd_teacher=with_opd_teacher)
 
         for m in all_replay_managers:

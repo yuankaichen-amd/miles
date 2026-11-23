@@ -107,7 +107,7 @@ if os.environ.get("TRAIN_HSA_NO_SCRATCH_RECLAIM"):
     env["HSA_NO_SCRATCH_RECLAIM"] = os.environ["TRAIN_HSA_NO_SCRATCH_RECLAIM"]
 if os.environ.get("TURBO_PYTHONPATH"):
     env["PYTHONPATH"] = os.environ["TURBO_PYTHONPATH"] + ":" + os.environ["PYTHONPATH"]
-for key in ("K3P_KDA_CONV", "PRIMUS_DSA_DKV_SAFE", "PRIMUS_DSA_BWD_BLOCK_H", "PRIMUS_DSA_BWD_NUM_STAGES"):
+for key in ("K3P_KDA_CONV", "PRIMUS_DSA_DKV_SAFE", "PRIMUS_DSA_BWD_BLOCK_H", "PRIMUS_DSA_BWD_NUM_STAGES", "PRIMUS_DSA_BWD_R_CHUNK"):
     if os.environ.get(key):
         env[key] = os.environ[key]
 env.update({k: v for k, v in os.environ.items() if k.startswith(("TORCH_DISTRIBUTED_", "TORCH_NCCL_"))})
