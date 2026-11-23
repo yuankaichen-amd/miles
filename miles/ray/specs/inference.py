@@ -414,4 +414,7 @@ def compute_inference_engine_env_vars(args) -> dict[str, str]:
         from miles.utils import dumper_utils
 
         env_vars.update(dumper_utils.get_sglang_env(args))
+    # MILES_ROLLOUT_ENV_<NAME>=v sets <NAME>=v for the engines only; trainers share the Ray runtime env.
+    prefix = "MILES_ROLLOUT_ENV_"
+    env_vars.update({k[len(prefix) :]: v for k, v in os.environ.items() if k.startswith(prefix) and len(k) > len(prefix) and v})
     return env_vars

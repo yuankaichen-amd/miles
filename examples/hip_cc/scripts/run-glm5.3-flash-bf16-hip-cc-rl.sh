@@ -195,7 +195,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --attention-softmax-in-fp32 \
   --calculate-per-token-loss \
   --rollout-num-gpus-per-engine 8 \
-  --sglang-mem-fraction-static 0.8 \
+  --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION:-0.8}" \
   "${CUDA_GRAPH_ARGS[@]}" \
   "${SGLANG_PROFILE_ARGS[@]}" \
   "${RADIX_ARGS[@]}" \
