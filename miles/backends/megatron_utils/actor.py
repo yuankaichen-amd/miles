@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import shutil
+import socket
 from contextlib import ExitStack, nullcontext
 
 import torch
@@ -126,7 +127,16 @@ class MegatronTrainRayActor(TrainRayActor):
         if fraction := os.environ.get("MILES_CUDA_MEMORY_FRACTION"):
             device = torch.cuda.current_device()
             torch.cuda.set_per_process_memory_fraction(float(fraction), device)
-            logger.info(f"cuda memory fraction {fraction} on device {device}")
+            props = torch.cuda.get_device_properties(device)
+            applied = getattr(torch.cuda, "get_per_process_memory_fraction", lambda d: float(fraction))(device)
+            # Ray's log dedup drops every token containing a digit before comparing lines, so a
+            # letters-only spelling of the rank keeps one line per rank in the driver log.
+            rank_tag = "".join(chr(ord("a") + int(c)) for c in f"{dist.get_rank():03d}")
+            logger.info(
+                f"cuda memory fraction applied: tag={rank_tag} rank {dist.get_rank()} host {socket.gethostname()} "
+                f"device {device} uuid {props.uuid} fraction {applied} "
+                f"limit {applied * props.total_memory / 2**30:.2f} GiB of {props.total_memory / 2**30:.2f} GiB"
+            )
 
         for m in all_replay_managers:
             m.register_replay_list_func = register_replay_list_sequential
