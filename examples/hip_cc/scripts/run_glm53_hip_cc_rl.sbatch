@@ -56,6 +56,12 @@ mapfile -t ALL_NODES < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 RAY_LIST=$(IFS=,; echo "${ALL_NODES[*]:0:${RAY_NODES}}")
 host_ip() { srun --overlap -N1 -n1 -w "$1" bash -c "ip -4 -o addr show ${SOCKET_IFNAME} | awk '{print \$4}' | cut -d/ -f1"; }
 export HEAD_IP=$(host_ip "${ALL_NODES[0]}")
+# Ray sorts its one all-GPU placement group by node IP (miles/ray/placement_group.py), so the trainer
+# ranks land on the TRAIN_NODES lowest-IP nodes, not on the first nodes of the allocation.
+TRAINER_HOSTS=$(srun --overlap --nodes="${RAY_NODES}" --ntasks="${RAY_NODES}" --ntasks-per-node=1 -w "${RAY_LIST}" \
+  bash -c "echo \$(ip -4 -o addr show ${SOCKET_IFNAME} | awk '{print \$4}' | cut -d/ -f1) \$(hostname)" \
+  | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | head -n "${TRAIN_NODES}" | awk '{print $2}' | tr '\n' ' ')
+[ "$(wc -w <<< "${TRAINER_HOSTS}")" = "${TRAIN_NODES}" ] || { echo "trainer hosts by IP: '${TRAINER_HOSTS}'"; exit 1; }
 
 RUN_LOG_DIR=${SHARED_ROOT}/logs/hip-cc-rl-${SLURM_JOB_ID}
 export CC_RUN_DIR=${RUN_LOG_DIR}/cc
@@ -67,19 +73,21 @@ export HIP_SF_URL_FILE=${HIP_SF_URL_FILE:-${SHARED_ROOT}/hip-cc/crusoe_relay_url
 export HIP_SANDBOX_TOKEN_FILE=${HIP_SANDBOX_TOKEN_FILE:-${HOME}/.hip_cc/crusoe_grader_token}
 CC_TRAINER=${CC_CONTAINERS_TRAINER:-8}
 CC_ROLLOUT=${CC_CONTAINERS_ROLLOUT:-32}
+# Evaluated on each node by the cc_node launch: trainer hosts get CC_TRAINER containers.
+CC_CAP_CMD="case ' ${TRAINER_HOSTS} ' in (*\" \$(hostname) \"*) echo ${CC_TRAINER};; (*) echo ${CC_ROLLOUT};; esac"
 export CP_SIZE=${CP_SIZE:-8} MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-16384}
 
 echo "== role map (job ${SLURM_JOB_ID}, ${RUN_NAME:-glm53-hip-cc})"
 for i in $(seq 0 $(( RAY_NODES - 1 ))); do
-  if [ "${i}" -lt "${TRAIN_NODES}" ]; then role="trainer PP stage ${i}, CP ${CP_SIZE}x${MAX_TOKENS_PER_GPU}"; cap=${CC_TRAINER}
-  else role="SGLang rollout engine $(( i - TRAIN_NODES )) (TP8)"; cap=${CC_ROLLOUT}; fi
+  if [[ " ${TRAINER_HOSTS} " == *" ${ALL_NODES[$i]} "* ]]; then role="trainer, CP ${CP_SIZE}x${MAX_TOKENS_PER_GPU}"; cap=${CC_TRAINER}
+  else role="SGLang rollout engine (TP8)"; cap=${CC_ROLLOUT}; fi
   echo "node ${i} ${ALL_NODES[$i]}: ${role}; cc-runner x${cap} + cc-gateway$([ "$i" = 0 ] && echo '; Ray head, rollout driver')"
 done
 echo "containers: $(( TRAIN_NODES * CC_TRAINER + ROLLOUT_NODES * CC_ROLLOUT )) total; async concurrency ${ASYNC_MAX_CONCURRENT_SAMPLES:-32}"
 echo "data: train ${HIP_TRAIN:-unset} val ${HIP_VAL:-unset}; ckpt ${HF_CKPT}; grader URLs ${HIP_SF_URL_FILE}"
 if [ "${DRY_RUN:-0}" = 1 ]; then
   CC_SECRETS_DIR=/nonexistent srun --nodes="${RAY_NODES}" --ntasks="${RAY_NODES}" --ntasks-per-node=1 -w "${RAY_LIST}" \
-    bash -c "CC_CONTAINERS_PER_NODE=\$( [ \${SLURM_NODEID} -lt ${TRAIN_NODES} ] && echo ${CC_TRAINER} || echo ${CC_ROLLOUT} ) DRY_RUN=1 bash ${SCRIPTS}/cc_node.sh"
+    bash -c "CC_CONTAINERS_PER_NODE=\$(${CC_CAP_CMD}) DRY_RUN=1 bash ${SCRIPTS}/cc_node.sh"
   echo "DRY_RUN: nothing started"; exit 0
 fi
 
@@ -116,7 +124,7 @@ srun --nodes="${RAY_NODES}" --ntasks="${RAY_NODES}" --ntasks-per-node=1 --kill-o
 
 # cc nodes come up in parallel with the Ray cluster. The step stays alive on the runners.
 srun --overlap --nodes="${RAY_NODES}" --ntasks="${RAY_NODES}" --ntasks-per-node=1 -w "${RAY_LIST}" \
-  bash -c "export CC_CONTAINERS_PER_NODE=\$( [ \${SLURM_NODEID} -lt ${TRAIN_NODES} ] && echo ${CC_TRAINER} || echo ${CC_ROLLOUT} ); exec bash ${SCRIPTS}/cc_node.sh" \
+  bash -c "export CC_CONTAINERS_PER_NODE=\$(${CC_CAP_CMD}); exec bash ${SCRIPTS}/cc_node.sh" \
   > "${CC_RUN_DIR}/cc_node.log" 2>&1 &
 CC_PID=$!
 
