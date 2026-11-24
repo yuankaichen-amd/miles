@@ -35,9 +35,11 @@ WRONG = "__global__ void k() {}  // wrong"
 class FakeClient:
     """Scripted grader replies keyed by path; records every payload."""
 
-    def __init__(self, script: dict[str, list[Result]] | None = None):
+    def __init__(self, script: dict[str, list[Result]] | None = None, timeout: float = 900.0):
         self.script = script or {}
         self.calls: list[tuple[str, dict]] = []
+        self.timeouts: list[float | None] = []
+        self.timeout = timeout
         self.stats = Stats()
 
     def call(self, method, path, payload=None):
@@ -51,10 +53,12 @@ class FakeClient:
         self.stats.record(result)
         return result
 
-    def call_with_retry(self, method, path, payload=None, *, retries=1, delay_s=5.0, sleep=None):
+    def call_with_retry(self, method, path, payload=None, *, retries=1, delay_s=5.0, sleep=None, timeout=None,
+                        terminal_timeout=False):
+        self.timeouts.append(timeout)
         result = self.call(method, path, payload)
         for _ in range(retries):
-            if result.kind != "infra":
+            if result.kind != "infra" or (terminal_timeout and result.timed_out):
                 break
             result = self.call(method, path, payload)
         return result
@@ -68,7 +72,7 @@ class NullLog:
         self.events.append({"event": event, **fields})
 
 
-def make_proxy(tmp_path, client, **spec_overrides):
+def make_proxy(tmp_path, client, proxy_kwargs=None, **spec_overrides):
     ws = tmp_path / "ws"
     (ws / "solution").mkdir(parents=True, exist_ok=True)
     (ws / "solution" / "kernel.hip").write_text("// stub\n")
@@ -76,11 +80,14 @@ def make_proxy(tmp_path, client, **spec_overrides):
             "gateway_url": "http://127.0.0.1:1", "gateway_token": SECRET, "model": "m", **spec_overrides}
     spec = cc_runner.EpisodeSpec.from_json(body)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-    return cc_runner.EvalProxy(spec, client, NullLog(), pool, retry_delay_s=0)
+    return cc_runner.EvalProxy(spec, client, NullLog(), pool, retry_delay_s=0, **(proxy_kwargs or {}))
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+TIMEOUT = Result("infra", 0, None, "transport: TimeoutError", timed_out=True)
 
 
 def test_correctness_is_charged_once_per_code_and_cached(tmp_path):
@@ -123,6 +130,118 @@ def test_retry_after_502_succeeds_and_charges_once(tmp_path):
     assert ok and proxy.used["correctness"] == 1
     seqs = [p["seq"] for _, p in client.calls]
     assert seqs == [1, 1], "a retry must reuse the seq so the grader dedupes it"
+
+
+def test_timeout_is_terminal_uncharged_and_caps_the_action(tmp_path):
+    client = FakeClient({"/tool/correctness": [TIMEOUT]})
+    proxy = make_proxy(tmp_path, client)
+    ok, text = run(proxy.check("correctness", GOOD))
+    # Same treatment as any infra failure before the cap: unavailable, not charged, nothing cached.
+    assert not ok and "check unavailable (infrastructure); not counted against your budget" in text
+    assert proxy.used["correctness"] == 0 and proxy.unavailable["correctness"] == 1
+    assert len(client.calls) == 1, "a timeout must not be retried"
+    ok, text = run(proxy.check("correctness", WRONG))
+    assert not ok and "timed out on an earlier correctness check" in text and "not counted" in text
+    assert len(client.calls) == 1 and proxy.unavailable["correctness"] == 2 and proxy.used["correctness"] == 0
+    ok, _ = run(proxy.check("performance", GOOD))
+    assert ok and len(client.calls) == 2, "the cap is per action"
+    assert [e.get("kind") for e in proxy.log.events if e["event"] == "check"] == ["infra", "timeout_cap", "ok"]
+    metrics = proxy.metrics()
+    assert metrics["timeouts"]["correctness"] == 1 and metrics["checks_inflight"] == 0
+
+
+def test_timeout_cap_resets_after_an_ok_result(tmp_path):
+    ok_reply = Result("ok", 200, {"correct": False})
+    client = FakeClient({"/tool/correctness": [TIMEOUT, ok_reply, TIMEOUT, TIMEOUT, ok_reply]})
+    proxy = make_proxy(tmp_path, client, proxy_kwargs={"max_consecutive_timeouts": 2})
+    results = [run(proxy.check("correctness", f"{WRONG} {i}"))[0] for i in range(5)]
+    # timeout (1), ok (reset to 0), timeout (1), timeout (2), then capped without a call
+    assert results == [False, True, False, False, False]
+    assert len(client.calls) == 4
+    assert proxy.consecutive_timeouts["correctness"] == 2 and proxy.timeouts["correctness"] == 3
+
+
+def test_grader_error_reply_does_not_reset_the_cap(tmp_path):
+    error_reply = Result("ok", 200, {"status": "error", "detail": "profiling timeout"})
+    client = FakeClient({"/tool/correctness": [TIMEOUT, error_reply, TIMEOUT]})
+    proxy = make_proxy(tmp_path, client, proxy_kwargs={"max_consecutive_timeouts": 2})
+    for i in range(4):
+        run(proxy.check("correctness", f"{WRONG} {i}"))
+    assert len(client.calls) == 3 and proxy.consecutive_timeouts["correctness"] == 2
+
+
+def test_late_failure_near_the_clamped_timeout_counts_as_a_timeout(tmp_path):
+    import time as _time
+
+    class Slow(FakeClient):
+        def call(self, method, path, payload=None):
+            _time.sleep(0.3)
+            return super().call(method, path, payload)
+
+    client = Slow({"/tool/correctness": [Result("infra", 502, {}, "HTTP 502")]})
+    proxy = make_proxy(tmp_path, client)
+    proxy.arm(0.3)
+    run(proxy.check("correctness", GOOD))
+    assert proxy.consecutive_timeouts["correctness"] == 1
+
+
+def test_no_grader_call_after_the_episode_is_done_or_closed(tmp_path):
+    client = FakeClient()
+    proxy = make_proxy(tmp_path, client)
+    proxy.done.set()
+    ok, text = run(proxy.check("correctness", GOOD))
+    assert not ok and "episode is over" in text and client.calls == []
+    proxy = make_proxy(tmp_path, client)
+    proxy.close()
+    ok, text = run(proxy.check("performance", GOOD))
+    assert not ok and "episode is over" in text and client.calls == []
+    assert proxy.log.events == [], "nothing is written to a closed episode log"
+
+
+def test_checks_queued_behind_a_stuck_check_are_dropped_when_the_episode_closes(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class Stuck(FakeClient):
+        def call(self, method, path, payload=None):
+            if not self.calls:
+                release.wait(5)
+            return super().call(method, path, payload)
+
+    client = Stuck()
+    proxy = make_proxy(tmp_path, client)
+
+    async def scenario():
+        first = asyncio.create_task(proxy.check("correctness", GOOD))
+        await asyncio.sleep(0.05)
+        queued = asyncio.create_task(proxy.check("correctness", WRONG))
+        await asyncio.sleep(0.05)
+        assert proxy.metrics()["checks_inflight"] == 1
+        proxy.close()
+        release.set()
+        return await first, await queued
+
+    (ok1, _), (ok2, text2) = run(scenario())
+    assert ok1 and not ok2 and "episode is over" in text2
+    assert len(client.calls) == 1 and proxy.inflight == 0
+    assert proxy.log.events == [], "the late result of the in-flight check is not logged after close"
+
+
+def test_grader_call_timeout_is_clamped_to_the_remaining_wall_time(tmp_path):
+    client = FakeClient(timeout=900.0)
+    proxy = make_proxy(tmp_path, client)
+    run(proxy.check("correctness", f"{GOOD} 0"))
+    assert client.timeouts[-1] == 900.0, "unarmed: the client default"
+    proxy.arm(100.0)
+    run(proxy.check("correctness", f"{GOOD} 1"))
+    assert 99.0 < client.timeouts[-1] <= 100.0
+    proxy.arm(5000.0)
+    run(proxy.check("correctness", f"{GOOD} 2"))
+    assert client.timeouts[-1] == 900.0, "never longer than the client default"
+    proxy.arm(-1.0)
+    ok, text = run(proxy.check("correctness", f"{GOOD} 3"))
+    assert not ok and "time limit has passed" in text and len(client.calls) == 3
 
 
 def test_counters_need_passing_correctness_and_501_is_not_charged(tmp_path):

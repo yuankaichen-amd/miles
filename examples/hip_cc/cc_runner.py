@@ -174,7 +174,7 @@ def summarize(action: str, body: dict, cap: int) -> str:
 
 class EvalProxy:
     def __init__(self, spec: EpisodeSpec, client: GraderClient, log: JsonlLog, pool, *, retry_delay_s: float = 5.0,
-                 denial_log: JsonlLog | None = None):
+                 denial_log: JsonlLog | None = None, max_consecutive_timeouts: int = 1):
         self.spec = spec
         self.client = client
         self.log = log
@@ -193,6 +193,25 @@ class EvalProxy:
         self.done = asyncio.Event()
         self.done_info: dict = {}
         self.denials = 0
+        # A grader timeout is uncharged, so the budgets do not bound it: cap consecutive timeouts per
+        # action, clamp each call to the episode's remaining wall time, and send nothing once it ends.
+        self.max_consecutive_timeouts = max_consecutive_timeouts
+        self.consecutive_timeouts = dict.fromkeys(CHECK_ACTIONS, 0)
+        self.timeouts = dict.fromkeys(CHECK_ACTIONS, 0)
+        self.deadline: float | None = None
+        self.closed = False
+        self.inflight = 0
+
+    def arm(self, seconds: float) -> None:
+        """Start the wall clock: no grader call may outlast it."""
+        self.deadline = time.time() + seconds
+
+    def close(self) -> None:
+        self.closed = True
+
+    def _event(self, event: str, **fields) -> None:
+        if not self.closed:
+            self.log(event, **fields)
 
     def status_text(self) -> str:
         return "budgets used: " + ", ".join(f"{k} {self.used[k]}/{self.budgets[k]}" for k in self.budgets)
@@ -260,20 +279,45 @@ class EvalProxy:
         if self.used[action] >= self.budgets[action]:
             self.log("check", action=action, sha=digest[:16], kind="budget", charged=False)
             return False, f"{action} budget exhausted ({self.budgets[action]} used); not run"
+        if self.closed or self.done.is_set():
+            return False, f"{action} not run: the episode is over; not counted against your budget"
+        remaining = None if self.deadline is None else self.deadline - time.time()
+        if remaining is not None and remaining <= 0:
+            self._event("check", action=action, sha=digest[:16], kind="deadline", charged=False)
+            return False, f"{action} not run: the episode's time limit has passed; not counted against your budget"
+        if self.consecutive_timeouts[action] >= self.max_consecutive_timeouts:
+            self.unavailable[action] += 1
+            self._event("check", action=action, sha=digest[:16], kind="timeout_cap", charged=False)
+            return False, (f"{action} unavailable: the grader timed out on an earlier {action} check in this "
+                           "episode; not counted against your budget")
+        timeout = self.client.timeout if remaining is None else min(self.client.timeout, remaining)
         self.seq += 1
         payload = {"episode": self.spec.episode, "seq": self.seq, "task_id": self.spec.task_id,
                    "task_version": self.spec.task_version, "code": code}
         started = time.time()
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            self.pool, lambda: self.client.call_with_retry("POST", f"/tool/{action}", payload,
-                                                           retries=1, delay_s=self.retry_delay_s))
+        self.inflight += 1
+        try:
+            result = await loop.run_in_executor(
+                self.pool, lambda: self.client.call_with_retry("POST", f"/tool/{action}", payload,
+                                                               retries=1, delay_s=self.retry_delay_s,
+                                                               timeout=timeout, terminal_timeout=True))
+        finally:
+            self.inflight -= 1
+        seconds = time.time() - started
         event = {"action": action, "seq": self.seq, "sha": digest[:16], "kind": result.kind,
-                 "status": result.status, "seconds": round(time.time() - started, 2), "error": result.error}
+                 "status": result.status, "seconds": round(seconds, 2), "error": result.error}
         failure = grader_error(result.body or {}) if result.kind == "ok" else None
+        # A grader-side build timeout can come back as a late error reply rather than a socket timeout.
+        if result.timed_out or ((result.kind != "ok" or failure is not None) and seconds >= 0.9 * timeout):
+            self.consecutive_timeouts[action] += 1
+            self.timeouts[action] += 1
+            event["timed_out"] = True
+        elif result.kind == "ok" and failure is None:
+            self.consecutive_timeouts[action] = 0
         if failure is not None:
             self.unavailable[action] += 1
-            self.log("check", charged=False, grader_error=failure, **event)
+            self._event("check", charged=False, grader_error=failure, **event)
             return False, f"{action} unavailable ({failure}); not counted against your budget"
         if result.kind == "ok":
             self.used[action] += 1
@@ -283,10 +327,10 @@ class EvalProxy:
             header = f"{action} check {self.used[action]}/{self.budgets[action]} on MI355X:\n"
             text = header + summarize(action, result.body or {}, SUMMARY_CAP[action] - len(header))
             self.cache[(action, digest)] = text
-            self.log("check", charged=True, passed=passed, **event)
+            self._event("check", charged=True, passed=passed, **event)
             return True, text
         self.unavailable[action] += 1
-        self.log("check", charged=False, **event)
+        self._event("check", charged=False, **event)
         if result.kind == "unsupported":
             return False, f"{action} unavailable on the grader pool right now; not counted against your budget"
         if result.kind == "rejected":
@@ -296,7 +340,8 @@ class EvalProxy:
 
     def metrics(self) -> dict:
         return {"used": dict(self.used), "budgets": dict(self.budgets), "unavailable": dict(self.unavailable),
-                "checks_sent": self.seq, "correctness_passed_hashes": len(self.passed)}
+                "checks_sent": self.seq, "correctness_passed_hashes": len(self.passed),
+                "timeouts": dict(self.timeouts), "checks_inflight": self.inflight}
 
 
 # ---------------------------------------------------------------- gateway forwarder
@@ -650,6 +695,7 @@ class Runner:
                 if rc != 0:
                     raise RuntimeError(f"tar into {target} failed: {err.decode(errors='replace')[:300]}")
             await self.docker.run("exec", "-d", name, "python3", "/opt/cc/uds_relay.py")
+            proxy.arm(spec.wall_s + self.args.wall_grace_s)
             rc, _, err = await self.docker.run("exec", "-d", name, "bash", "/home/agent/.cc/run.sh")
             if rc != 0:
                 raise RuntimeError(f"starting claude failed: {err.decode(errors='replace')[:300]}")
@@ -671,6 +717,7 @@ class Runner:
             reason = "error"
             log("error", error=f"{type(exc).__name__}: {exc}"[:500])
         finally:
+            proxy.close()
             for server in servers:
                 server.close()
             if episode.container:

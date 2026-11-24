@@ -19,6 +19,7 @@ import http.client
 import json
 import os
 import queue
+import socket
 import stat
 import threading
 import time
@@ -62,6 +63,7 @@ class Result:
     error: str = ""
     url: str = ""
     seconds: float = 0.0
+    timed_out: bool = False
 
     @property
     def ok(self) -> bool:
@@ -125,7 +127,9 @@ class GraderClient:
         except queue.Full:
             conn.close()
 
-    def _once(self, base: str, method: str, path: str, payload: dict | None) -> Result:
+    def _once(self, base: str, method: str, path: str, payload: dict | None, *, timeout: float | None = None,
+              terminal_timeout: bool = False) -> Result:
+        timeout = self.timeout if timeout is None else timeout
         token = read_token(self.token_path)
         headers = {"Authorization": f"Bearer {token}", "Connection": "keep-alive"}
         data = None
@@ -138,6 +142,10 @@ class GraderClient:
             conn = self._connection(base)
             if fresh:
                 conn.close()
+            # Pooled connections keep the timeout of their last call: set it on every use.
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
             try:
                 conn.request(method, prefix + path, body=data, headers=headers)
                 response = conn.getresponse()
@@ -150,9 +158,10 @@ class GraderClient:
                 break
             except (OSError, http.client.HTTPException) as exc:
                 conn.close()
-                if fresh:
+                timed_out = isinstance(exc, (TimeoutError, socket.timeout))
+                if fresh or (timed_out and terminal_timeout):
                     return Result("infra", error=f"transport: {type(exc).__name__}", url=base,
-                                  seconds=time.time() - started)
+                                  seconds=time.time() - started, timed_out=timed_out)
         try:
             body = json.loads(raw) if raw else {}
         except ValueError:
@@ -164,13 +173,18 @@ class GraderClient:
             return Result("unsupported", status, body, "HTTP 501", base, seconds)
         infra_body = body.get("infrastructure_error") or body.get("error") == "infrastructure_error"
         if status >= 500 or infra_body:
-            return Result("infra", status, body, f"HTTP {status}", base, seconds)
+            return Result("infra", status, body, f"HTTP {status}", base, seconds, timed_out=status == 504)
         if status >= 400:
             return Result("rejected", status, body, f"HTTP {status}", base, seconds)
         return Result("ok", status, body, "", base, seconds)
 
-    def call(self, method: str, path: str, payload: dict | None = None) -> Result:
-        """One attempt over the URL list: the first URL that answers decides."""
+    def call(self, method: str, path: str, payload: dict | None = None, *, timeout: float | None = None,
+             terminal_timeout: bool = False) -> Result:
+        """One attempt over the URL list: the first URL that answers decides.
+
+        With ``terminal_timeout`` a timeout (socket timeout or HTTP 504) ends the call: no
+        fresh-connection retry and no next URL, so one call costs the grader at most one timeout.
+        """
         urls = read_urls(self.url_path)
         if not urls:
             result = Result("infra", error="no grader URLs in the URL file")
@@ -178,18 +192,19 @@ class GraderClient:
             return result
         result = None
         for base in urls:
-            result = self._once(base, method, path, payload)
-            if not (result.kind == "infra" and result.status == 0):
+            result = self._once(base, method, path, payload, timeout=timeout, terminal_timeout=terminal_timeout)
+            if not (result.kind == "infra" and result.status == 0) or (terminal_timeout and result.timed_out):
                 break
         self.stats.record(result)
         return result
 
     def call_with_retry(self, method: str, path: str, payload: dict | None = None, *,
-                        retries: int = 1, delay_s: float = 5.0, sleep=time.sleep) -> Result:
-        result = self.call(method, path, payload)
+                        retries: int = 1, delay_s: float = 5.0, sleep=time.sleep, timeout: float | None = None,
+                        terminal_timeout: bool = False) -> Result:
+        result = self.call(method, path, payload, timeout=timeout, terminal_timeout=terminal_timeout)
         for _ in range(retries):
-            if result.kind != "infra":
+            if result.kind != "infra" or (terminal_timeout and result.timed_out):
                 break
             sleep(delay_s)
-            result = self.call(method, path, payload)
+            result = self.call(method, path, payload, timeout=timeout, terminal_timeout=terminal_timeout)
         return result
