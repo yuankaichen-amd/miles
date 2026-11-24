@@ -17,6 +17,7 @@ from tqdm import tqdm
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.conn_status import ConnStatusManager
 from miles.backends.training_utils.parallel import ParallelState
+from miles.backends.training_utils.weight_update.bucket_timing import recorder as timing
 from miles.backends.training_utils.weight_update.protocol import get_weight_transfer_protocol
 from miles.backends.training_utils.weight_update.session import (
     begin_weight_update,
@@ -98,6 +99,7 @@ class WeightUpdater:
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
             return
         self.weight_version += 1
+        timing.begin_sync(self.weight_version)
 
         sync_base = not self.is_lora or protocol.needs_base_resync_for_lora
         adapters = self._get_updated_adapters()
@@ -131,6 +133,7 @@ class WeightUpdater:
                     pbar.update(1)
             protocol.after_base_weights()
             dist.barrier(group=get_gloo_group())
+        timing.end_sync()
 
         with timer("finalize_and_resume_engines"):
             protocol.finalize(self.weight_version)

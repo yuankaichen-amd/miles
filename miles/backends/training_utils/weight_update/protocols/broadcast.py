@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState, get_parallel_state
+from miles.backends.training_utils.weight_update.bucket_timing import recorder as timing
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.protocol import WeightTransferProtocol
 from miles.backends.training_utils.weight_update.utils import get_data_replica_rank_and_size
@@ -83,7 +84,8 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
                 bucket,
                 selector=self._selector,
             )
-            async_utils.wait_futures(futures)
+            with timing.phase("engine_ack"):
+                async_utils.wait_futures(futures)
             bucket.clear()
 
 
@@ -173,10 +175,11 @@ def update_weights_from_distributed(
     contiguous_tensors = [
         param.data if param.data.is_contiguous() else param.data.contiguous() for _, param in converted_named_tensors
     ]
-    handles = []
-    for tensor in contiguous_tensors:
-        handles.append(dist.broadcast(tensor, 0, group=group, async_op=True))
-    for handle in handles:
-        handle.wait()
+    with timing.phase("send_nccl"):
+        handles = []
+        for tensor in contiguous_tensors:
+            handles.append(dist.broadcast(tensor, 0, group=group, async_op=True))
+        for handle in handles:
+            handle.wait()
 
     return futures

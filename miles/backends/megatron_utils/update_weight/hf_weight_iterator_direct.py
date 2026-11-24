@@ -10,6 +10,7 @@ from miles.backends.megatron_utils.update_weight.hf_weight_iterator import (
     _iter_mm_tower_units,
 )
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.weight_update.bucket_timing import recorder as timing
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.types import ParamInfo
@@ -42,6 +43,8 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             desc="Update weights",
         )
         for param_infos in self._non_expert_batches:
+            if timing.active:
+                timing.next_batch("dense", sum(_get_param_full_size(info) for info in param_infos))
             named_params = _materialize_non_expert_batch(
                 self.args, param_infos, weights, gather_pp=self.placement.gather_pp
             )
@@ -50,6 +53,10 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             del named_params
             pbar.update(1)
         for param_infos in self._expert_batches:
+            if timing.active:
+                timing.next_batch(
+                    "expert", sum(_get_param_full_size(info) for info in param_infos) * get_parallel_state().ep.size
+                )
             named_params = _materialize_expert_batch(
                 self.args, param_infos, weights, gather_pp=self.placement.gather_pp
             )
@@ -75,11 +82,13 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
 
     def _convert_to_hf_param_units(self, named_params: Sequence[tuple[str, torch.Tensor]]):
         for name, param in named_params:
-            yield list(
-                convert_to_hf(
-                    self.args, self.model_name, name, param, self.quantization_config, self.packed_weight_basenames
+            with timing.phase("convert"):
+                unit = list(
+                    convert_to_hf(
+                        self.args, self.model_name, name, param, self.quantization_config, self.packed_weight_basenames
+                    )
                 )
-            )
+            yield unit
 
 
 def _load_or_allocate_params(param_infos: Sequence[ParamInfo], megatron_local_weights) -> list[torch.Tensor]:
@@ -127,11 +136,14 @@ def _materialize_non_expert_batch(
 ) -> list[tuple[str, torch.Tensor]]:
     """Load -> PP broadcast (when gather_pp) -> TP all_gather."""
     monkey_patch_torch_reductions()
-    params = _load_or_allocate_params(param_infos, megatron_local_weights)
+    with timing.phase("load"):
+        params = _load_or_allocate_params(param_infos, megatron_local_weights)
     if gather_pp:
-        _broadcast_across_pp(param_infos, params)
+        with timing.phase("pp_bcast"):
+            _broadcast_across_pp(param_infos, params)
     _set_tp_attrs(param_infos, params)
-    gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
+    with timing.phase("tp_gather"):
+        gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
     return [(info.name, param) for info, param in zip(param_infos, gathered, strict=True)]
 
 
@@ -148,11 +160,14 @@ def _materialize_expert_batch(
     symmetric EP all_gather with a name exchange.
     """
     monkey_patch_torch_reductions()
-    params = _load_or_allocate_params(param_infos, megatron_local_weights)
+    with timing.phase("load"):
+        params = _load_or_allocate_params(param_infos, megatron_local_weights)
     if gather_pp:
-        _broadcast_across_pp(param_infos, params)
+        with timing.phase("pp_bcast"):
+            _broadcast_across_pp(param_infos, params)
     _set_tp_attrs(param_infos, params)
-    etp_gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
+    with timing.phase("etp_gather"):
+        etp_gathered = all_gather_params_async(args, list(zip(param_infos, params, strict=True)))
 
     ep = get_parallel_state().ep
     if ep.size == 1:
@@ -160,21 +175,23 @@ def _materialize_expert_batch(
 
     names = [info.name for info in param_infos]
     all_names: list = [None] * ep.size
-    dist.all_gather_object(all_names, names, group=ep.group)
+    with timing.phase("ep_names"):
+        dist.all_gather_object(all_names, names, group=ep.group)
     for ep_names in all_names:
         assert len(ep_names) == len(
             names
         ), f"EP-asymmetric expert batch: {len(names)} params locally vs {len(ep_names)} on a peer rank"
 
     all_gathered: list[list[tuple[str, torch.Tensor]]] = [[] for _ in range(ep.size)]
-    handles = []
-    for i, param in enumerate(etp_gathered):
-        buffers = [torch.empty_like(param, device=torch.cuda.current_device()) for _ in range(ep.size)]
-        handles.append(dist.all_gather(buffers, param, group=ep.group, async_op=True))
-        for ep_rank, ep_names in enumerate(all_names):
-            all_gathered[ep_rank].append((ep_names[i], buffers[ep_rank]))
-    for handle in handles:
-        handle.wait()
+    with timing.phase("ep_gather"):
+        handles = []
+        for i, param in enumerate(etp_gathered):
+            buffers = [torch.empty_like(param, device=torch.cuda.current_device()) for _ in range(ep.size)]
+            handles.append(dist.all_gather(buffers, param, group=ep.group, async_op=True))
+            for ep_rank, ep_names in enumerate(all_names):
+                all_gathered[ep_rank].append((ep_names[i], buffers[ep_rank]))
+        for handle in handles:
+            handle.wait()
 
     return [named for per_rank in all_gathered for named in per_rank]
 
